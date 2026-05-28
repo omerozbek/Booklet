@@ -25,9 +25,10 @@ export default defineConfig({
       },
       workbox: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
+        navigateFallback: 'index.html',
+        navigateFallbackDenylist: [/^\/api\//],
         runtimeCaching: [
           {
-            // Cache proxied images for offline reading
             urlPattern: /\/api\/proxy/,
             handler: 'CacheFirst',
             options: {
@@ -37,6 +38,9 @@ export default defineConfig({
             },
           },
         ],
+      },
+      devOptions: {
+        enabled: true,
       },
     }),
   ],

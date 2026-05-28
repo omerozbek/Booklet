@@ -2,11 +2,15 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const path = require('path');
+const https = require('https');
+const fs = require('fs');
+const selfsigned = require('selfsigned');
 const registry = require('./scrapers/registry');
 const imageCache = require('./imageCache');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const HTTPS_PORT = process.env.HTTPS_PORT || 3443;
 
 // Keyed by base domain (e.g. "comix.to") → cookie string from a real browser session
 const domainCookies = new Map();
@@ -130,8 +134,29 @@ app.get('*', (req, res) => {
   });
 });
 
+// HTTP server (localhost dev use)
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n Manhwa Reader backend → http://localhost:${PORT}`);
-  console.log(' For iPhone access, use your local IP (run ipconfig to find it)');
-  console.log(' e.g. http://192.168.1.XXX:3001\n');
+  console.log(` HTTP  → http://localhost:${PORT}`);
+});
+
+// HTTPS server — required for service worker / PWA on iPhone over LAN
+async function getOrCreateCert() {
+  const keyPath = path.join(__dirname, 'cert.key');
+  const certPath = path.join(__dirname, 'cert.pem');
+  if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+    return { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) };
+  }
+  const attrs = [{ name: 'commonName', value: 'manhwa-reader.local' }];
+  const pems = await selfsigned.generate(attrs, { days: 825, keySize: 2048 });
+  fs.writeFileSync(keyPath, pems.private);
+  fs.writeFileSync(certPath, pems.cert);
+  return { key: pems.private, cert: pems.cert };
+}
+
+getOrCreateCert().then((tlsCreds) => {
+  https.createServer(tlsCreds, app).listen(HTTPS_PORT, '0.0.0.0', () => {
+    console.log(` HTTPS → https://localhost:${HTTPS_PORT}`);
+    console.log('\n For iPhone: open https://<your-PC-IP>:3443 in Safari');
+    console.log(' Accept the self-signed cert warning once, then "Add to Home Screen"\n');
+  });
 });

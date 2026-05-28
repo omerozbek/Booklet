@@ -23,6 +23,10 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Generated TLS cert (auto-created by server on first run)
+backend/cert.key
+backend/cert.pem
+
 # Generated icons (run generate-icons.mjs to recreate)
 frontend/public/icon-192.png
 frontend/public/icon-512.png
