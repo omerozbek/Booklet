@@ -5,7 +5,8 @@ A self-hosted Progressive Web App for downloading and reading manhwa on your iPh
 ## Features
 
 - Add any title by pasting its URL
-- Download chapters for offline reading
+- Download chapters for offline reading (with cancel support)
+- Delete titles — removes all downloaded chapters and images
 - Vertical scroll reader optimized for webtoon/manhwa format
 - Works as a full-screen PWA when added to iPhone home screen
 - Extensible scraper system — add new sites easily
@@ -51,6 +52,16 @@ ipconfig        # look for IPv4 Address, e.g. 192.168.1.42
 ```
 
 Open `http://192.168.1.42:3001` in iPhone Safari, tap **Share → Add to Home Screen**.
+
+> **iPhone can't connect?** Your Windows network profile is probably set to Public. Run this in PowerShell as Administrator to fix it:
+> ```powershell
+> Get-NetConnectionProfile | Where-Object { $_.NetworkCategory -eq "Public" } | Set-NetConnectionProfile -NetworkCategory Private
+> ```
+> Also allow the ports through Windows Firewall:
+> ```powershell
+> New-NetFirewallRule -DisplayName "Manhwa Vite 5173" -Direction Inbound -Protocol TCP -LocalPort 5173 -Action Allow -Profile Any
+> New-NetFirewallRule -DisplayName "Manhwa Backend 3001" -Direction Inbound -Protocol TCP -LocalPort 3001 -Action Allow -Profile Any
+> ```
 
 ## Usage
 
@@ -99,9 +110,10 @@ const scrapers = {
 ├── backend/
 │   ├── server.js           # Express API (title, chapter, proxy endpoints)
 │   └── scrapers/
-│       ├── base.js         # Base class with fetch + cheerio helpers
-│       ├── comixto.js      # comix.to scraper
-│       └── registry.js     # hostname → scraper mapping
+│       ├── base.js             # Base class with fetch + cheerio helpers
+│       ├── comixto.js          # comix.to scraper
+│       ├── logging10000.js     # logging10000.com scraper
+│       └── registry.js         # hostname → scraper mapping
 └── frontend/
     └── src/
         ├── db.js                   # IndexedDB wrapper (titles, chapters, images)
