@@ -3,9 +3,13 @@ const cors = require('cors');
 const axios = require('axios');
 const path = require('path');
 const registry = require('./scrapers/registry');
+const imageCache = require('./imageCache');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Keyed by base domain (e.g. "comix.to") → cookie string from a real browser session
+const domainCookies = new Map();
 
 app.use(cors());
 app.use(express.json());
@@ -36,6 +40,15 @@ app.get('/api/chapter', async (req, res) => {
   try {
     const scraper = registry.getScraper(url);
     const data = await scraper.fetchChapter(url);
+
+    // Store browser cookies server-side so the proxy can reuse them
+    if (data._cookies && data._cookieDomain) {
+      domainCookies.set(data._cookieDomain, data._cookies);
+      console.log('[chapter] stored cookies for', data._cookieDomain);
+    }
+    delete data._cookies;
+    delete data._cookieDomain;
+
     res.json(data);
   } catch (err) {
     console.error('[chapter]', err.message);
@@ -48,24 +61,48 @@ app.get('/api/proxy', async (req, res) => {
   const { url, referer } = req.query;
   if (!url) return res.status(400).json({ error: 'url parameter required' });
 
+  const origin = new URL(url).origin;
+  const hostname = new URL(url).hostname;
+
+  // Serve from puppeteer-captured cache (session-bound CDN tokens work here)
+  const cached = imageCache.get(url);
+  if (cached) {
+    res.set('Content-Type', cached.contentType);
+    res.set('Cache-Control', 'public, max-age=604800');
+    res.set('Access-Control-Allow-Origin', '*');
+    return res.send(cached.buffer);
+  }
+
+  // Find stored browser cookies for this domain (e.g. Cloudflare cf_clearance)
+  let cookieHeader = '';
+  for (const [domain, value] of domainCookies) {
+    if (hostname === domain || hostname.endsWith('.' + domain)) {
+      cookieHeader = value;
+      break;
+    }
+  }
+
   try {
-    const origin = new URL(url).origin;
     const response = await axios.get(url, {
       responseType: 'stream',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Referer': referer || origin,
         'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        ...(cookieHeader && { 'Cookie': cookieHeader }),
       },
       timeout: 30000,
+      maxRedirects: 5,
     });
 
     res.set('Content-Type', response.headers['content-type'] || 'image/jpeg');
-    res.set('Cache-Control', 'public, max-age=604800'); // 7-day cache
+    res.set('Cache-Control', 'public, max-age=604800');
     res.set('Access-Control-Allow-Origin', '*');
     response.data.pipe(res);
   } catch (err) {
-    console.error('[proxy]', err.message);
+    const status = err.response?.status || 'ERR';
+    console.error(`[proxy] ${status} fetching ${url} — ${err.message}`);
     res.status(502).json({ error: 'Failed to fetch image' });
   }
 });

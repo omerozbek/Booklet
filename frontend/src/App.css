@@ -112,6 +112,41 @@ html, body, #root {
 
 .title-card:active { transform: scale(0.97); border-color: var(--accent); }
 
+.title-card-cover-wrap {
+  position: relative;
+}
+
+.title-card-delete {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.65);
+  color: #fff;
+  border: none;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 2;
+}
+
+.title-card:hover .title-card-delete,
+.title-card-cover-wrap:hover .title-card-delete {
+  opacity: 1;
+}
+
+/* Always visible on touch devices */
+@media (hover: none) {
+  .title-card-delete { opacity: 1; }
+}
+
 .title-card-cover {
   width: 100%;
   aspect-ratio: 2/3;

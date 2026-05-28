@@ -1,43 +1,8 @@
 const BaseScraper = require('./base');
-const puppeteer = require('puppeteer-core');
-const fs = require('fs');
+const { getBrowser } = require('../browser');
+const imageCache = require('../imageCache');
 
 const BASE = 'https://comix.to';
-const EDGE_PATH = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
-
-const BROWSER_PATHS = [
-  EDGE_PATH,
-  'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
-  'C:/Program Files/Google/Chrome/Application/chrome.exe',
-  'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-  '/usr/bin/google-chrome',
-  '/usr/bin/chromium-browser',
-];
-
-function findBrowser() {
-  const env = process.env.BROWSER_PATH;
-  if (env && fs.existsSync(env)) return env;
-  return BROWSER_PATHS.find(p => fs.existsSync(p)) || null;
-}
-
-let _browser = null;
-async function getBrowser() {
-  if (_browser) {
-    try { await _browser.version(); return _browser; } catch { _browser = null; }
-  }
-  const executablePath = findBrowser();
-  if (!executablePath) throw new Error('No Chrome/Edge found. Set BROWSER_PATH env var.');
-  console.log('[browser] Using:', executablePath);
-  _browser = await puppeteer.launch({
-    executablePath,
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--window-size=1280,900'],
-  });
-  _browser.on('disconnected', () => { _browser = null; });
-  return _browser;
-}
 
 class ComixToScraper extends BaseScraper {
   constructor() { super(BASE); }
@@ -151,55 +116,61 @@ class ComixToScraper extends BaseScraper {
   async fetchChapter(url) {
     const page = await this._openPage(url);
     try {
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 40000 });
+      // Capture image responses as they load — must be synchronous, buffer() called immediately
+      page.on('response', (response) => {
+        const ct = response.headers()['content-type'] || '';
+        if (!response.ok() || !ct.startsWith('image/')) return;
+        response.buffer()
+          .then(buf => imageCache.set(response.url(), buf, ct))
+          .catch(() => {});
+      });
 
-      // Wait for at least one reader image to appear
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 40000 });
       await page.waitForSelector('.rpage-page__img', { timeout: 20000 });
 
-      // Get total page count from the reader state / DOM
       const totalPages = await page.evaluate(() => {
-        // Try swiper slide count
         const slides = document.querySelectorAll('.swiper-slide:not(.swiper-slide-duplicate)');
         if (slides.length > 1) return slides.length;
-        // Try rpage containers
-        const pages = document.querySelectorAll('.rpage-page');
-        return pages.length || 0;
+        return document.querySelectorAll('.rpage-page').length || 0;
       });
 
-      // Extract currently-loaded images to get the CDN base URL
-      const loadedImages = await page.evaluate(() => {
-        return Array.from(document.querySelectorAll('.rpage-page__img'))
+      // Force all lazy images to load so the response interceptor captures them
+      await page.evaluate(() => {
+        document.querySelectorAll('.rpage-page__img').forEach(img => {
+          const src = img.dataset?.src || img.dataset?.lazySrc;
+          if (src && (!img.src || img.src === window.location.href)) img.src = src;
+        });
+      });
+      // Wait for the triggered requests to complete
+      await page.waitForNetworkIdle({ idleTime: 1500, timeout: 20000 }).catch(() => {});
+
+      let images = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('.rpage-page__img'))
           .map(img => img.src || img.dataset?.src)
-          .filter(s => s && !s.startsWith('data:'));
-      });
+          .filter(s => s && s.startsWith('http'))
+      );
 
-      if (!loadedImages.length) throw new Error('No images found in reader');
+      if (!images.length) throw new Error('No images found in reader');
 
-      // Infer full image list from the pattern: /si/{token}/{n}.webp
-      const firstSrc = loadedImages[0];
-      const baseMatch = firstSrc.match(/^(.+\/)(\d+)\.(webp|jpg|jpeg|png)$/i);
-
-      if (baseMatch && totalPages > 1) {
-        const [, base, , ext] = baseMatch;
-        const images = [];
-        for (let i = 1; i <= totalPages; i++) {
-          images.push(`${base}${i}.${ext}`);
+      // Fill any gaps not loaded via DOM with URL pattern inference
+      if (images.length < totalPages) {
+        const firstSrc = images[0];
+        const baseMatch = firstSrc && firstSrc.match(/^(.+\/)(\d+)\.(webp|jpg|jpeg|png)$/i);
+        if (baseMatch) {
+          const [, base, startStr, ext] = baseMatch;
+          const start = parseInt(startStr, 10);
+          images = Array.from({ length: totalPages }, (_, i) => `${base}${start + i}.${ext}`);
+          console.log(`[chapter] inferred ${images.length} URLs from pattern, start=${start}`);
         }
-        return { images };
       }
 
-      // Fallback: scroll to load all lazy images then collect
-      if (totalPages > loadedImages.length) {
-        await this._scrollToLoadAll(page, totalPages);
-        const allImages = await page.evaluate(() =>
-          Array.from(document.querySelectorAll('.rpage-page__img'))
-            .map(img => img.src || img.dataset?.src)
-            .filter(s => s && !s.startsWith('data:'))
-        );
-        return { images: allImages };
-      }
+      const cached = images.filter(u => imageCache.get(u)).length;
+      console.log(`[chapter] ${images.length} URLs, ${cached} already cached, first: ${images[0]}`);
 
-      return { images: loadedImages };
+      const cookies = await page.cookies();
+      const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+      return { images, _cookieDomain: new URL(url).hostname, _cookies: cookieStr };
     } finally {
       await page.close().catch(() => {});
     }

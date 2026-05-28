@@ -41,7 +41,7 @@ export default defineConfig({
     }),
   ],
   server: {
-    // Proxy /api calls to Express backend during development
+    host: true, // expose to LAN so phones can connect via your IP
     proxy: {
       '/api': {
         target: 'http://localhost:3001',

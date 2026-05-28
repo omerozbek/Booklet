@@ -4,6 +4,8 @@ import { saveTitleMeta, saveChapterMeta } from '../db';
 export default function AddTitle({ onClose, onAdded }) {
   const [url, setUrl] = useState('');
   const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState('');
+  const [progress, setProgress] = useState(null); // { current, total }
   const [error, setError] = useState('');
 
   async function handleAdd() {
@@ -11,6 +13,8 @@ export default function AddTitle({ onClose, onAdded }) {
     if (!trimmed) return;
     setError('');
     setLoading(true);
+    setStatus('Fetching title info…');
+    setProgress(null);
 
     try {
       const res = await fetch(`/api/title?url=${encodeURIComponent(trimmed)}`);
@@ -19,11 +23,16 @@ export default function AddTitle({ onClose, onAdded }) {
       if (data.error) throw new Error(data.error);
       if (!data.title && !data.chapters?.length) throw new Error('Could not find any content at this URL. Try a different link.');
 
+      setStatus('Saving title…');
       const titleMeta = { url: trimmed, ...data, chapters: undefined };
       await saveTitleMeta(titleMeta);
 
-      for (const ch of data.chapters || []) {
-        await saveChapterMeta({ ...ch, titleUrl: trimmed, downloaded: false, imageCount: 0 });
+      const chapters = data.chapters || [];
+      setStatus(`Saving chapters…`);
+      setProgress({ current: 0, total: chapters.length });
+      for (let i = 0; i < chapters.length; i++) {
+        await saveChapterMeta({ ...chapters[i], titleUrl: trimmed, downloaded: false, imageCount: 0 });
+        setProgress({ current: i + 1, total: chapters.length });
       }
 
       onAdded(titleMeta);
@@ -32,6 +41,8 @@ export default function AddTitle({ onClose, onAdded }) {
       setError(err.message);
     } finally {
       setLoading(false);
+      setStatus('');
+      setProgress(null);
     }
   }
 
@@ -62,9 +73,25 @@ export default function AddTitle({ onClose, onAdded }) {
           style={{ marginBottom: 12 }}
         />
 
+        {loading && (
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 6 }}>{status}</div>
+            {progress && (
+              <>
+                <div className="progress-bar">
+                  <div className="progress-fill" style={{ width: `${(progress.current / progress.total) * 100}%` }} />
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4, textAlign: 'right' }}>
+                  {progress.current} / {progress.total}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn btn-primary" style={{ flex: 1 }} onClick={handleAdd} disabled={loading || !url.trim()}>
-            {loading ? <><div className="spinner" style={{ width: 16, height: 16, borderWidth: 2 }} /> Fetching…</> : 'Add Title'}
+            {loading ? <><div className="spinner" style={{ width: 16, height: 16, borderWidth: 2 }} /> Adding…</> : 'Add Title'}
           </button>
           <button className="btn btn-secondary" onClick={onClose} disabled={loading}>Cancel</button>
         </div>

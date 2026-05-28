@@ -18,8 +18,10 @@ export default function TitleView() {
   const [meta, setMeta] = useState(null);
   const [chapters, setChapters] = useState([]);
   const [downloading, setDownloading] = useState({}); // chapterUrl → { current, total }
+  const [downloadingAll, setDownloadingAll] = useState(false);
   const [error, setError] = useState('');
   const abortRefs = useRef({});
+  const cancelAllRef = useRef(false);
 
   // Load from IndexedDB then refresh from network
   useEffect(() => {
@@ -82,6 +84,7 @@ export default function TitleView() {
       for (let i = 0; i < images.length; i++) {
         if (abort.signal.aborted) break;
         const proxyUrl = `/api/proxy?url=${encodeURIComponent(images[i])}&referer=${encodeURIComponent(chapter.url)}`;
+
         const imgRes = await fetch(proxyUrl, { signal: abort.signal });
         if (!imgRes.ok) throw new Error(`Image fetch failed: ${imgRes.status}`);
         const blob = await imgRes.blob();
@@ -112,10 +115,20 @@ export default function TitleView() {
   }
 
   async function downloadAll() {
+    cancelAllRef.current = false;
+    setDownloadingAll(true);
     const toDownload = chapters.filter((c) => !c.downloaded && !downloading[c.url]);
     for (const ch of toDownload) {
+      if (cancelAllRef.current) break;
       await downloadChapter(ch);
     }
+    setDownloadingAll(false);
+  }
+
+  function cancelDownloadAll() {
+    cancelAllRef.current = true;
+    Object.keys(abortRefs.current).forEach((url) => abortRefs.current[url]?.abort());
+    setDownloadingAll(false);
   }
 
   function cancelDownload(chapterUrl) {
@@ -177,9 +190,15 @@ export default function TitleView() {
         {chapters.length > 0 && (
           <>
             <div className="chapter-actions">
-              <button className="btn btn-primary btn-sm" onClick={downloadAll}>
-                Download All ({chapters.length - downloadedCount} left)
-              </button>
+              {downloadingAll ? (
+                <button className="btn btn-secondary btn-sm" onClick={cancelDownloadAll}>
+                  Cancel Download
+                </button>
+              ) : (
+                <button className="btn btn-primary btn-sm" onClick={downloadAll}>
+                  Download All ({chapters.length - downloadedCount} left)
+                </button>
+              )}
               {downloadedCount > 0 && (
                 <span style={{ fontSize: 13, color: 'var(--text-muted)', alignSelf: 'center' }}>
                   {downloadedCount}/{chapters.length} saved

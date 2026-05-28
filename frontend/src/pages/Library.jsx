@@ -44,16 +44,23 @@ export default function Library() {
                 className="title-card"
                 onClick={() => navigate('/title', { state: { titleUrl: t.url } })}
               >
-                {t.coverUrl ? (
-                  <img
-                    className="title-card-cover"
-                    src={`/api/proxy?url=${encodeURIComponent(t.coverUrl)}&referer=${encodeURIComponent(t.url)}`}
-                    alt={t.title}
-                    loading="lazy"
-                  />
-                ) : (
-                  <div className="title-card-cover-placeholder">📖</div>
-                )}
+                <div className="title-card-cover-wrap">
+                  {t.coverUrl ? (
+                    <img
+                      className="title-card-cover"
+                      src={`/api/proxy?url=${encodeURIComponent(t.coverUrl)}&referer=${encodeURIComponent(t.url)}`}
+                      alt={t.title}
+                      loading="lazy"
+                    />
+                  ) : (
+                    <div className="title-card-cover-placeholder">📖</div>
+                  )}
+                  <button
+                    className="title-card-delete"
+                    onClick={(e) => handleDelete(e, t.url)}
+                    title="Delete title"
+                  >✕</button>
+                </div>
                 <div className="title-card-name">{t.title || 'Untitled'}</div>
               </div>
             ))}
