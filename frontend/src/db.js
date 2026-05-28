@@ -87,6 +87,12 @@ export async function getChapterImages(chapterUrl) {
   return imgs.sort((a, b) => a.index - b.index).map((i) => i.blob);
 }
 
+export async function saveChapterReadStatus(chapterUrl, status) {
+  const db = await getDb();
+  const ch = await db.get('chapters', chapterUrl);
+  if (ch) await db.put('chapters', { ...ch, readStatus: status, lastReadAt: Date.now() });
+}
+
 export async function deleteChapterImages(chapterUrl) {
   const db = await getDb();
   const imgs = await db.getAllFromIndex('images', 'chapterUrl', chapterUrl);

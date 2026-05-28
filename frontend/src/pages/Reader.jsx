@@ -1,26 +1,34 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { getChapterImages } from '../db';
+import { getChapterImages, saveChapterReadStatus } from '../db';
+
+const CIRCUMFERENCE = 2 * Math.PI * 20; // r=20
 
 export default function Reader() {
   const { state } = useLocation();
   const navigate = useNavigate();
   const { chapterUrl, titleUrl, chapters = [], startIndex = 0 } = state || {};
 
-  const [images, setImages] = useState([]); // array of { src, isBlob }
+  const [images, setImages] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [showOverlay, setShowOverlay] = useState(true);
   const [currentChapterIdx, setCurrentChapterIdx] = useState(startIndex);
+  const [nextProgress, setNextProgress] = useState(0);
+
   const overlayTimer = useRef(null);
+  const nextTriggerRef = useRef(false);
+  const nextProgressRef = useRef(0);
   const currentChapter = chapters[currentChapterIdx];
+  const hasNext = currentChapterIdx < chapters.length - 1;
 
   useEffect(() => {
+    nextTriggerRef.current = false;
+    setNextProgress(0);
     if (!currentChapter) return;
     loadChapter(currentChapter);
   }, [currentChapterIdx]);
 
-  // Auto-hide overlay after 3s
   useEffect(() => {
     if (showOverlay) {
       clearTimeout(overlayTimer.current);
@@ -29,13 +37,44 @@ export default function Reader() {
     return () => clearTimeout(overlayTimer.current);
   }, [showOverlay]);
 
+  // Scroll-to-next detection
+  useEffect(() => {
+    if (loading || !hasNext) return;
+
+    const ZONE = 240;
+
+    function onScroll() {
+      const scrolled = window.scrollY + window.innerHeight;
+      const total = document.documentElement.scrollHeight;
+      const raw = (scrolled - (total - ZONE)) / ZONE;
+      const progress = Math.max(0, Math.min(1, raw));
+      setNextProgress(progress);
+      nextProgressRef.current = progress;
+    }
+
+    function onTouchEnd() {
+      if (nextProgressRef.current >= 1 && !nextTriggerRef.current) {
+        nextTriggerRef.current = true;
+        saveChapterReadStatus(currentChapter.url, 'completed');
+        goToChapter(currentChapterIdx + 1);
+      }
+    }
+
+    window.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('touchend', onTouchEnd);
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      window.removeEventListener('touchend', onTouchEnd);
+    };
+  }, [loading, currentChapterIdx, chapters.length, hasNext, images.length]);
+
   async function loadChapter(chapter) {
     setLoading(true);
     setImages([]);
     setError('');
+    saveChapterReadStatus(chapter.url, 'reading');
 
     try {
-      // Try IndexedDB first (downloaded chapters)
       const blobs = await getChapterImages(chapter.url);
       if (blobs.length > 0) {
         setImages(blobs.map((blob) => ({ src: URL.createObjectURL(blob), isBlob: true })));
@@ -43,7 +82,6 @@ export default function Reader() {
         return;
       }
 
-      // Fall back to streaming via proxy
       const res = await fetch(`/api/chapter?url=${encodeURIComponent(chapter.url)}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const { images: urls } = await res.json();
@@ -62,7 +100,6 @@ export default function Reader() {
     }
   }
 
-  // Cleanup blob URLs on unmount / chapter change
   useEffect(() => {
     return () => {
       images.forEach((img) => { if (img.isBlob) URL.revokeObjectURL(img.src); });
@@ -93,8 +130,8 @@ export default function Reader() {
       {/* Top overlay */}
       <div className={`reader-overlay ${showOverlay ? '' : 'hidden'}`} onClick={(e) => e.stopPropagation()}>
         <button
-          className="btn btn-ghost btn-icon"
-          style={{ color: '#fff' }}
+          className="btn btn-icon"
+          style={{ color: 'var(--text)', flexShrink: 0 }}
           onClick={() => navigate('/title', { state: { titleUrl } })}
         >
           ←
@@ -116,6 +153,34 @@ export default function Reader() {
           {images.map((img, i) => (
             <LazyImage key={img.src} src={img.src} index={i} />
           ))}
+
+          {/* Pull-to-next zone */}
+          {hasNext ? (
+            <div className="reader-next-zone">
+              <svg width="52" height="52" viewBox="0 0 48 48">
+                <circle cx="24" cy="24" r="20" fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="3" />
+                <circle
+                  cx="24" cy="24" r="20"
+                  fill="none"
+                  stroke="var(--accent)"
+                  strokeWidth="3"
+                  strokeLinecap="round"
+                  strokeDasharray={CIRCUMFERENCE}
+                  strokeDashoffset={CIRCUMFERENCE * (1 - nextProgress)}
+                  transform="rotate(-90 24 24)"
+                  style={{ transition: 'stroke-dashoffset 0.08s' }}
+                />
+                <text x="24" y="28" textAnchor="middle" fontSize="11" fill="rgba(255,255,255,0.7)">↓</text>
+              </svg>
+              <span className="reader-next-label">
+                {nextProgress >= 1 ? 'Loading…' : 'Next Chapter'}
+              </span>
+            </div>
+          ) : (
+            <div className="reader-end-zone">
+              <span>End of available chapters</span>
+            </div>
+          )}
         </div>
       )}
 
@@ -133,7 +198,7 @@ export default function Reader() {
         </span>
         <button
           className="btn btn-secondary btn-sm"
-          disabled={currentChapterIdx >= chapters.length - 1}
+          disabled={!hasNext}
           onClick={() => goToChapter(currentChapterIdx + 1)}
         >
           Next →
@@ -145,7 +210,7 @@ export default function Reader() {
 
 function LazyImage({ src, index }) {
   const ref = useRef(null);
-  const [visible, setVisible] = useState(index < 3); // eagerly load first 3
+  const [visible, setVisible] = useState(index < 3);
 
   useEffect(() => {
     if (visible) return;
