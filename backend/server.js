@@ -1,0 +1,100 @@
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+const path = require('path');
+const registry = require('./scrapers/registry');
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+app.use(cors());
+app.use(express.json());
+
+// Serve built frontend in production
+app.use(express.static(path.join(__dirname, '../frontend/dist')));
+
+// Fetch title info + chapter list from a manhwa site URL
+app.get('/api/title', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: 'url parameter required' });
+
+  try {
+    const scraper = registry.getScraper(url);
+    const data = await scraper.fetchTitle(url);
+    res.json(data);
+  } catch (err) {
+    console.error('[title]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Fetch image URLs for a single chapter
+app.get('/api/chapter', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: 'url parameter required' });
+
+  try {
+    const scraper = registry.getScraper(url);
+    const data = await scraper.fetchChapter(url);
+    res.json(data);
+  } catch (err) {
+    console.error('[chapter]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Proxy images to bypass CORS / hotlink protection
+app.get('/api/proxy', async (req, res) => {
+  const { url, referer } = req.query;
+  if (!url) return res.status(400).json({ error: 'url parameter required' });
+
+  try {
+    const origin = new URL(url).origin;
+    const response = await axios.get(url, {
+      responseType: 'stream',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Referer': referer || origin,
+        'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+      },
+      timeout: 30000,
+    });
+
+    res.set('Content-Type', response.headers['content-type'] || 'image/jpeg');
+    res.set('Cache-Control', 'public, max-age=604800'); // 7-day cache
+    res.set('Access-Control-Allow-Origin', '*');
+    response.data.pipe(res);
+  } catch (err) {
+    console.error('[proxy]', err.message);
+    res.status(502).json({ error: 'Failed to fetch image' });
+  }
+});
+
+// Search for a title by keyword using the first available scraper
+app.get('/api/search', async (req, res) => {
+  const { q, site } = req.query;
+  if (!q) return res.status(400).json({ error: 'q parameter required' });
+
+  try {
+    const scraper = site ? registry.getScraperByHost(site) : registry.getDefault();
+    const data = await scraper.search(q);
+    res.json(data);
+  } catch (err) {
+    console.error('[search]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Serve frontend for all non-API routes (SPA fallback)
+app.get('*', (req, res) => {
+  const distIndex = path.join(__dirname, '../frontend/dist/index.html');
+  res.sendFile(distIndex, (err) => {
+    if (err) res.status(404).send('Run `npm run build` in the frontend folder first.');
+  });
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n Manhwa Reader backend → http://localhost:${PORT}`);
+  console.log(' For iPhone access, use your local IP (run ipconfig to find it)');
+  console.log(' e.g. http://192.168.1.XXX:3001\n');
+});
