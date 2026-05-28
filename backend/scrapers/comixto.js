@@ -1,235 +1,244 @@
 const BaseScraper = require('./base');
-const axios = require('axios');
+const puppeteer = require('puppeteer-core');
+const fs = require('fs');
 
 const BASE = 'https://comix.to';
+const EDGE_PATH = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+
+const BROWSER_PATHS = [
+  EDGE_PATH,
+  'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
+  'C:/Program Files/Google/Chrome/Application/chrome.exe',
+  'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  '/usr/bin/google-chrome',
+  '/usr/bin/chromium-browser',
+];
+
+function findBrowser() {
+  const env = process.env.BROWSER_PATH;
+  if (env && fs.existsSync(env)) return env;
+  return BROWSER_PATHS.find(p => fs.existsSync(p)) || null;
+}
+
+let _browser = null;
+async function getBrowser() {
+  if (_browser) {
+    try { await _browser.version(); return _browser; } catch { _browser = null; }
+  }
+  const executablePath = findBrowser();
+  if (!executablePath) throw new Error('No Chrome/Edge found. Set BROWSER_PATH env var.');
+  console.log('[browser] Using:', executablePath);
+  _browser = await puppeteer.launch({
+    executablePath,
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--window-size=1280,900'],
+  });
+  _browser.on('disconnected', () => { _browser = null; });
+  return _browser;
+}
 
 class ComixToScraper extends BaseScraper {
-  constructor() {
-    super(BASE);
+  constructor() { super(BASE); }
+
+  async _openPage(url) {
+    const browser = await getBrowser();
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1280, height: 900 });
+    return page;
   }
+
+  // ─── Title + chapter list (DOM scraping) ────────────────────────────────
 
   async fetchTitle(url) {
-    const { $, html } = await this.fetchHtml(url);
-
-    // Strategy 1: Next.js embedded JSON
-    const nextData = this.extractNextData($);
-    if (nextData) {
-      const result = this._parseNextTitle(nextData, url);
-      if (result.title) return result;
-    }
-
-    // Strategy 2: Try the site's JSON API (common pattern: /api/comic/<slug>)
+    const page = await this._openPage(url);
     try {
-      const slug = url.match(/\/title\/([^/]+)/)?.[1];
-      if (slug) {
-        const apiResult = await this._tryApiTitle(slug);
-        if (apiResult) return apiResult;
-      }
-    } catch {}
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 35000 });
 
-    // Strategy 3: HTML parsing fallback
-    return this._parseHtmlTitle($, url);
-  }
-
-  async _tryApiTitle(slug) {
-    const endpoints = [
-      `${BASE}/api/comic/${slug}`,
-      `${BASE}/api/title/${slug}`,
-      `${BASE}/api/v1/comic/${slug}`,
-    ];
-    for (const endpoint of endpoints) {
-      try {
-        const { data } = await axios.get(endpoint, {
-          headers: { Referer: BASE },
-          timeout: 10000,
-        });
-        if (data && (data.title || data.name)) {
+      // Fast title metadata from initial-data
+      const meta = await page.evaluate(() => {
+        try {
+          const d = JSON.parse(document.getElementById('initial-data').textContent);
+          const queries = d.queries || {};
+          const key = Object.keys(queries).find(k => k.includes('"detail"'));
+          const comic = key ? queries[key] : {};
           return {
-            title: data.title || data.name,
-            coverUrl: data.cover || data.thumbnail || data.image,
-            synopsis: data.description || data.synopsis || '',
-            chapters: this._normalizeChapters(data.chapters || data.chapter_list || []),
+            title: comic.title,
+            coverUrl: comic.poster?.large || comic.poster?.medium,
+            synopsis: comic.synopsis || '',
+            status: comic.status,
+            genres: (comic.genres || []).map(g => g.title),
+            latestChapterNumber: comic.latestChapter,
           };
-        }
-      } catch {}
+        } catch { return {}; }
+      });
+
+      // Wait for chapter list
+      await page.waitForSelector('.mpage__chapters .mchap-row', { timeout: 15000 });
+
+      // Collect all chapters by paginating through all pages
+      const chapters = await this._scrapeAllChapterPages(page);
+
+      return { ...meta, chapters };
+    } finally {
+      await page.close().catch(() => {});
     }
-    return null;
   }
 
-  _parseNextTitle(nextData, url) {
-    const props = nextData?.props?.pageProps;
-    const comic = props?.comic || props?.title || props?.data || props?.series;
+  async _scrapeAllChapterPages(page) {
+    const seen = new Map(); // chapter number → chapter object
 
-    if (!comic) return { title: null };
+    let pageNum = 1;
+    while (true) {
+      // Extract all chapter rows on current page
+      const rows = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll('.mchap-row')).map(row => {
+          const a = row.querySelector('a[href*="-chapter-"]');
+          if (!a) return null;
+          const href = a.href;
+          const numMatch = href.match(/-chapter-([\d.]+)/);
+          return {
+            url: href,
+            number: numMatch ? parseFloat(numMatch[1]) : null,
+            title: a.querySelector('.mchap-row__ch')?.textContent.trim() ||
+                   a.textContent.trim(),
+          };
+        }).filter(Boolean);
+      });
 
-    const chapters = this._normalizeChapters(
-      comic.chapters || comic.chapter_list || comic.chapterList || []
-    );
-
-    return {
-      title: comic.title || comic.name,
-      coverUrl: comic.cover || comic.thumbnail || comic.image,
-      synopsis: comic.description || comic.synopsis || '',
-      status: comic.status,
-      genres: comic.genres || comic.tags || [],
-      chapters,
-    };
-  }
-
-  _normalizeChapters(rawChapters) {
-    return rawChapters
-      .map((ch, i) => {
-        const url =
-          ch.url ||
-          (ch.slug ? `${BASE}/chapter/${ch.slug}/` : null) ||
-          (ch.id ? `${BASE}/chapter/${ch.id}/` : null);
-        return {
-          title: ch.title || ch.name || `Chapter ${ch.number || ch.chapter_number || i + 1}`,
-          url,
-          number: ch.number || ch.chapter_number || i + 1,
-          date: ch.date || ch.created_at || null,
-        };
-      })
-      .filter((ch) => ch.url);
-  }
-
-  _parseHtmlTitle($, url) {
-    const title =
-      $('h1').first().text().trim() ||
-      $('.series-title, .manga-title, [class*="title"] h1').first().text().trim();
-
-    const coverUrl = this.resolveUrl(
-      $('img[class*="cover"], img[class*="thumbnail"], .thumb img, .cover img')
-        .first()
-        .attr('src')
-    );
-
-    const synopsis = $(
-      '.description, .synopsis, .summary, [class*="description"], [class*="synopsis"]'
-    )
-      .first()
-      .text()
-      .trim();
-
-    // Collect chapter links — deduplicated
-    const seen = new Set();
-    const chapters = [];
-    $(
-      'a[href*="/chapter/"], a[href*="/read/"], .chapter-list a, .chapters a, [class*="chapter"] a'
-    ).each((i, el) => {
-      const href = $(el).attr('href');
-      const text = $(el).text().trim();
-      if (href && !seen.has(href)) {
-        seen.add(href);
-        chapters.push({
-          title: text || `Chapter ${i + 1}`,
-          url: this.resolveUrl(href),
-          number: i + 1,
-        });
+      for (const ch of rows) {
+        const key = ch.number;
+        if (key !== null && !seen.has(key)) {
+          seen.set(key, ch);
+        }
       }
-    });
 
-    return { title, coverUrl, synopsis, chapters };
+      // Check if there's a next page
+      const hasNext = await page.evaluate(() => {
+        const btn = document.querySelector('.npager__nav[aria-label="Next page"]');
+        return btn && !btn.disabled;
+      });
+
+      if (!hasNext) break;
+
+      // Click next page and wait for refresh
+      await page.evaluate(() => {
+        document.querySelector('.npager__nav[aria-label="Next page"]')?.click();
+      });
+      await page.waitForFunction(
+        (prev) => {
+          const rows = document.querySelectorAll('.mchap-row');
+          if (rows.length === 0) return false;
+          const first = rows[0]?.querySelector('a')?.href;
+          return first !== prev;
+        },
+        {},
+        rows[0]?.url || ''
+      ).catch(() => {});
+      await new Promise(r => setTimeout(r, 200)); // small settle time
+
+      pageNum++;
+      if (pageNum > 200) break; // safety limit
+    }
+
+    return [...seen.values()].sort((a, b) => (a.number ?? 0) - (b.number ?? 0));
   }
+
+  // ─── Chapter images (DOM scraping) ──────────────────────────────────────
 
   async fetchChapter(url) {
-    const { $, html } = await this.fetchHtml(url, { Referer: url });
+    const page = await this._openPage(url);
+    try {
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 40000 });
 
-    // Strategy 1: Next.js data
-    const nextData = this.extractNextData($);
-    if (nextData) {
-      const images = this._extractNextImages(nextData);
-      if (images.length > 0) return { images };
-    }
+      // Wait for at least one reader image to appear
+      await page.waitForSelector('.rpage-page__img', { timeout: 20000 });
 
-    // Strategy 2: window.__data__ or similar embedded arrays
-    const windowImages = this._extractEmbeddedImages(html);
-    if (windowImages.length > 0) return { images: windowImages };
-
-    // Strategy 3: HTML img tags in reader area
-    const images = [];
-    const selectors = [
-      '.reader-area img',
-      '.chapter-content img',
-      '#chapter-content img',
-      '.reading-content img',
-      '.page-break img',
-      '[class*="reader"] img',
-      '[class*="chapter-images"] img',
-      'img[class*="page"]',
-    ];
-    for (const sel of selectors) {
-      $(sel).each((_, el) => {
-        const src =
-          $(el).attr('src') ||
-          $(el).attr('data-src') ||
-          $(el).attr('data-lazy-src') ||
-          $(el).attr('data-original');
-        if (src && !src.includes('placeholder') && !src.includes('loading') && src.includes('.')) {
-          images.push(this.resolveUrl(src));
-        }
+      // Get total page count from the reader state / DOM
+      const totalPages = await page.evaluate(() => {
+        // Try swiper slide count
+        const slides = document.querySelectorAll('.swiper-slide:not(.swiper-slide-duplicate)');
+        if (slides.length > 1) return slides.length;
+        // Try rpage containers
+        const pages = document.querySelectorAll('.rpage-page');
+        return pages.length || 0;
       });
-      if (images.length > 0) break;
-    }
 
-    return { images };
-  }
+      // Extract currently-loaded images to get the CDN base URL
+      const loadedImages = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll('.rpage-page__img'))
+          .map(img => img.src || img.dataset?.src)
+          .filter(s => s && !s.startsWith('data:'));
+      });
 
-  _extractNextImages(nextData) {
-    const props = nextData?.props?.pageProps;
-    const chapter = props?.chapter || props?.data || props?.images;
-    if (!chapter) return [];
+      if (!loadedImages.length) throw new Error('No images found in reader');
 
-    const list = Array.isArray(chapter)
-      ? chapter
-      : chapter.images || chapter.pages || chapter.image_list || [];
+      // Infer full image list from the pattern: /si/{token}/{n}.webp
+      const firstSrc = loadedImages[0];
+      const baseMatch = firstSrc.match(/^(.+\/)(\d+)\.(webp|jpg|jpeg|png)$/i);
 
-    return list
-      .map((img) => (typeof img === 'string' ? img : img.url || img.src || img.image))
-      .filter(Boolean)
-      .map((src) => this.resolveUrl(src));
-  }
-
-  _extractEmbeddedImages(html) {
-    // Look for JSON arrays of image URLs embedded in script tags
-    const patterns = [
-      /(?:images|pages|chapter_images)\s*[:=]\s*(\[[^\]]+\])/,
-      /(?:var|const|let)\s+\w+\s*=\s*(\[[^\]]*(?:jpg|jpeg|png|webp)[^\]]*\])/i,
-    ];
-    for (const pattern of patterns) {
-      try {
-        const match = html.match(pattern);
-        if (match) {
-          const arr = JSON.parse(match[1].replace(/'/g, '"'));
-          const urls = arr
-            .map((item) => (typeof item === 'string' ? item : item?.url || item?.src))
-            .filter(Boolean)
-            .map((src) => this.resolveUrl(src));
-          if (urls.length > 0) return urls;
+      if (baseMatch && totalPages > 1) {
+        const [, base, , ext] = baseMatch;
+        const images = [];
+        for (let i = 1; i <= totalPages; i++) {
+          images.push(`${base}${i}.${ext}`);
         }
-      } catch {}
+        return { images };
+      }
+
+      // Fallback: scroll to load all lazy images then collect
+      if (totalPages > loadedImages.length) {
+        await this._scrollToLoadAll(page, totalPages);
+        const allImages = await page.evaluate(() =>
+          Array.from(document.querySelectorAll('.rpage-page__img'))
+            .map(img => img.src || img.dataset?.src)
+            .filter(s => s && !s.startsWith('data:'))
+        );
+        return { images: allImages };
+      }
+
+      return { images: loadedImages };
+    } finally {
+      await page.close().catch(() => {});
     }
-    return [];
+  }
+
+  async _scrollToLoadAll(page, expected) {
+    let prev = 0;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      await page.evaluate(() => window.scrollBy(0, window.innerHeight * 3));
+      await new Promise(r => setTimeout(r, 400));
+      const count = await page.evaluate(() =>
+        document.querySelectorAll('.rpage-page__img[src]:not([src=""])').length
+      );
+      if (count >= expected || count === prev) break;
+      prev = count;
+    }
   }
 
   async search(query) {
-    const searchUrl = `${BASE}/search?q=${encodeURIComponent(query)}`;
+    // Use the fast HTML scraper for search (no auth needed for search page)
+    const searchUrl = `${BASE}/?q=${encodeURIComponent(query)}`;
     try {
       const { $ } = await this.fetchHtml(searchUrl);
       const results = [];
-      // Common search result selectors
-      $('.search-result, .comic-item, [class*="search"] [class*="item"]').each((_, el) => {
-        const link = $(el).find('a').first();
+      $('a[href*="/title/"]').each((_, el) => {
+        const href = $(el).attr('href');
         const img = $(el).find('img').first();
-        results.push({
-          title: link.text().trim() || $(el).find('[class*="title"]').text().trim(),
-          url: this.resolveUrl(link.attr('href')),
-          coverUrl: this.resolveUrl(img.attr('src') || img.attr('data-src')),
-        });
+        const title = $(el).find('[class*="title"], h3, h2').first().text().trim() ||
+                      img.attr('alt') || $(el).text().trim().substring(0, 60);
+        if (href && title && !results.find(r => r.url === `${BASE}${href}`)) {
+          results.push({
+            title,
+            url: `${BASE}${href}`,
+            coverUrl: img.attr('src') || img.attr('data-src'),
+          });
+        }
       });
-      return results.filter((r) => r.url);
-    } catch (err) {
-      console.error('[comixto search]', err.message);
+      return results.filter(r => r.title).slice(0, 20);
+    } catch {
       return [];
     }
   }
