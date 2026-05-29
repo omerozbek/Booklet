@@ -6,13 +6,20 @@ import AddTitle from '../components/AddTitle';
 export default function Library() {
   const [titles, setTitles] = useState([]);
   const [showAdd, setShowAdd] = useState(false);
+  const [lastRead, setLastRead] = useState(null);
   const navigate = useNavigate();
 
   const loadTitles = useCallback(async () => {
     setTitles(await getAllTitles());
   }, []);
 
-  useEffect(() => { loadTitles(); }, [loadTitles]);
+  useEffect(() => {
+    loadTitles();
+    try {
+      const lr = localStorage.getItem('last-read');
+      if (lr) setLastRead(JSON.parse(lr));
+    } catch {}
+  }, [loadTitles]);
 
   async function handleDelete(e, url) {
     e.stopPropagation();
@@ -21,16 +28,40 @@ export default function Library() {
     setTitles((prev) => prev.filter((t) => t.url !== url));
   }
 
+  const lastReadTitle = lastRead ? titles.find((t) => t.url === lastRead.titleUrl) : null;
+
   return (
     <div className="page">
       <div className="topbar">
         <span className="topbar-title">Manhwa Reader</span>
+        <button
+          className="btn btn-ghost btn-sm"
+          style={{ fontSize: 18, padding: '4px 8px' }}
+          onClick={() => navigate('/settings')}
+          title="Settings"
+        >
+          ⚙
+        </button>
         <button className="btn btn-primary btn-sm" onClick={() => setShowAdd(true)}>
           + Add
         </button>
       </div>
 
       <div className="scroll-area">
+        {lastRead && lastReadTitle && (
+          <div
+            className="continue-banner"
+            onClick={() => navigate('/read', { state: { chapterUrl: lastRead.chapterUrl, titleUrl: lastRead.titleUrl } })}
+          >
+            <div className="continue-info">
+              <span className="continue-label">Continue Reading</span>
+              <span className="continue-title-name">{lastReadTitle.title}</span>
+              <span className="continue-chapter-name">{lastRead.chapterTitle}</span>
+            </div>
+            <span className="continue-arrow">▶</span>
+          </div>
+        )}
+
         {titles.length === 0 ? (
           <div className="empty-state">
             <div className="icon">📚</div>
@@ -59,7 +90,9 @@ export default function Library() {
                     className="title-card-delete"
                     onClick={(e) => handleDelete(e, t.url)}
                     title="Delete title"
-                  >✕</button>
+                  >
+                    ✕
+                  </button>
                 </div>
                 <div className="title-card-name">{t.title || 'Untitled'}</div>
               </div>

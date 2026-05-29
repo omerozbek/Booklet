@@ -5,10 +5,9 @@ import {
   saveTitleMeta,
   getChaptersForTitle,
   saveChapterMeta,
-  getChapterImages,
-  saveImage,
   deleteChapterImages,
 } from '../db';
+import { useDownloads } from '../context/DownloadContext';
 
 export default function TitleView() {
   const { state } = useLocation();
@@ -17,29 +16,44 @@ export default function TitleView() {
 
   const [meta, setMeta] = useState(null);
   const [chapters, setChapters] = useState([]);
-  const [downloading, setDownloading] = useState({}); // chapterUrl → { current, total }
-  const [downloadingAll, setDownloadingAll] = useState(false);
   const [error, setError] = useState('');
   const [showEditNames, setShowEditNames] = useState(false);
   const [namePrefix, setNamePrefix] = useState('');
-  const abortRefs = useRef({});
-  const cancelAllRef = useRef(false);
 
-  // Load from IndexedDB then refresh from network
+  const chapterRowRefs = useRef({});
+  const hasAutoScrolled = useRef(false);
+
+  const { downloads, downloadingAll, downloadChapter, cancelDownload, downloadAll, cancelAll } = useDownloads();
+
   useEffect(() => {
     if (!titleUrl) return;
+    hasAutoScrolled.current = false;
     loadData();
   }, [titleUrl]);
 
+  // Auto-scroll to last read chapter once chapters are available
+  useEffect(() => {
+    if (!chapters.length || hasAutoScrolled.current) return;
+    const lastRead = chapters.reduce((best, ch) => {
+      if (!ch.lastReadAt) return best;
+      if (!best || ch.lastReadAt > best.lastReadAt) return ch;
+      return best;
+    }, null);
+    if (lastRead && chapterRowRefs.current[lastRead.url]) {
+      hasAutoScrolled.current = true;
+      setTimeout(() => {
+        chapterRowRefs.current[lastRead.url]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      }, 150);
+    }
+  }, [chapters]);
+
   async function loadData() {
-    // Show cached data immediately
     const cached = await getTitle(titleUrl);
     if (cached) setMeta(cached);
 
     const cachedChapters = await getChaptersForTitle(titleUrl);
     if (cachedChapters.length) setChapters(cachedChapters);
 
-    // Refresh from network
     try {
       const res = await fetch(`/api/title?url=${encodeURIComponent(titleUrl)}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -50,7 +64,6 @@ export default function TitleView() {
       await saveTitleMeta(titleMeta);
       setMeta(titleMeta);
 
-      // Merge chapters with download status from DB
       const existing = Object.fromEntries(cachedChapters.map((c) => [c.url, c]));
       const merged = (data.chapters || []).map((ch) => ({
         ...ch,
@@ -72,73 +85,16 @@ export default function TitleView() {
     }
   }
 
-  async function downloadChapter(chapter) {
-    if (downloading[chapter.url]) return;
-
-    try {
-      // Fetch image URL list
-      const res = await fetch(`/api/chapter?url=${encodeURIComponent(chapter.url)}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const { images } = await res.json();
-      if (!images?.length) throw new Error('No images found in this chapter');
-
-      const abort = new AbortController();
-      abortRefs.current[chapter.url] = abort;
-
-      setDownloading((prev) => ({ ...prev, [chapter.url]: { current: 0, total: images.length } }));
-
-      for (let i = 0; i < images.length; i++) {
-        if (abort.signal.aborted) break;
-        const proxyUrl = `/api/proxy?url=${encodeURIComponent(images[i])}&referer=${encodeURIComponent(chapter.url)}`;
-
-        const imgRes = await fetch(proxyUrl, { signal: abort.signal });
-        if (!imgRes.ok) throw new Error(`Image fetch failed: ${imgRes.status}`);
-        const blob = await imgRes.blob();
-        await saveImage(chapter.url, i, blob);
-        setDownloading((prev) => ({
-          ...prev,
-          [chapter.url]: { current: i + 1, total: images.length },
-        }));
-      }
-
-      if (!abort.signal.aborted) {
-        const updated = { ...chapter, downloaded: true, imageCount: images.length };
-        await saveChapterMeta(updated);
-        setChapters((prev) => prev.map((c) => (c.url === chapter.url ? updated : c)));
-      }
-    } catch (err) {
-      if (err.name !== 'AbortError') {
-        alert(`Download failed: ${err.message}`);
-      }
-    } finally {
-      setDownloading((prev) => {
-        const next = { ...prev };
-        delete next[chapter.url];
-        return next;
-      });
-      delete abortRefs.current[chapter.url];
-    }
+  function onChapterDownloaded(updated) {
+    setChapters((prev) => prev.map((c) => (c.url === updated.url ? { ...c, downloaded: true, imageCount: updated.imageCount } : c)));
   }
 
-  async function downloadAll() {
-    cancelAllRef.current = false;
-    setDownloadingAll(true);
-    const toDownload = chapters.filter((c) => !c.downloaded && !downloading[c.url]);
-    for (const ch of toDownload) {
-      if (cancelAllRef.current) break;
-      await downloadChapter(ch);
-    }
-    setDownloadingAll(false);
+  function handleDownloadChapter(chapter) {
+    downloadChapter(chapter, onChapterDownloaded);
   }
 
-  function cancelDownloadAll() {
-    cancelAllRef.current = true;
-    Object.keys(abortRefs.current).forEach((url) => abortRefs.current[url]?.abort());
-    setDownloadingAll(false);
-  }
-
-  function cancelDownload(chapterUrl) {
-    abortRefs.current[chapterUrl]?.abort();
+  function handleDownloadAll() {
+    downloadAll(chapters, titleUrl, onChapterDownloaded);
   }
 
   async function deleteChapter(chapter) {
@@ -178,23 +134,36 @@ export default function TitleView() {
     });
   }
 
-  if (!titleUrl) return <div className="page"><div className="scroll-area"><p>No title selected.</p></div></div>;
+  if (!titleUrl) {
+    return (
+      <div className="page">
+        <div className="scroll-area">
+          <p>No title selected.</p>
+        </div>
+      </div>
+    );
+  }
 
+  const isDownloadingAll = downloadingAll[titleUrl] || false;
   const downloadedCount = chapters.filter((c) => c.downloaded).length;
 
+  const lastReadChapter = chapters.reduce((best, ch, idx) => {
+    if (!ch.lastReadAt) return best;
+    if (!best || ch.lastReadAt > best.ch.lastReadAt) return { ch, idx };
+    return best;
+  }, null);
+
   return (
-    <div className="page">
+    <div className="page title-view-page">
       <div className="topbar">
-        <button className="btn btn-icon" onClick={() => navigate('/')}>
-          ←
-        </button>
+        <button className="btn btn-icon" onClick={() => navigate('/')}>←</button>
         <span className="topbar-title">{meta?.title || 'Loading…'}</span>
       </div>
 
-      <div className="scroll-area">
+      <div className="title-view-header">
         {error && <div className="error-banner">{error}</div>}
 
-        {meta && (
+        {meta ? (
           <div className="title-hero">
             <div className="title-cover">
               {meta.coverUrl ? (
@@ -211,82 +180,89 @@ export default function TitleView() {
               {meta.status && <div className="tag" style={{ marginBottom: 6 }}>{meta.status}</div>}
               {(meta.genres || []).map((g) => <span key={g} className="tag">{g}</span>)}
               {meta.synopsis && (
-                <p className="synopsis" style={{ marginTop: 8 }}>{meta.synopsis.slice(0, 200)}{meta.synopsis.length > 200 ? '…' : ''}</p>
+                <p className="synopsis" style={{ marginTop: 8 }}>
+                  {meta.synopsis.slice(0, 200)}{meta.synopsis.length > 200 ? '…' : ''}
+                </p>
               )}
             </div>
           </div>
-        )}
-
-        {chapters.length > 0 && (
-          <>
-            <div className="chapter-actions">
-              {downloadingAll ? (
-                <button className="btn btn-secondary btn-sm" onClick={cancelDownloadAll}>
-                  Cancel Download
-                </button>
-              ) : (
-                <button className="btn btn-primary btn-sm" onClick={downloadAll}>
-                  Download All ({chapters.length - downloadedCount} left)
-                </button>
-              )}
-              {downloadedCount > 0 && (
-                <span style={{ fontSize: 13, color: 'var(--text-muted)', alignSelf: 'center' }}>
-                  {downloadedCount}/{chapters.length} saved
-                </span>
-              )}
-              <button className="btn btn-secondary btn-sm" style={{ marginLeft: 'auto' }} onClick={openEditNames}>
-                Edit Names
-              </button>
-            </div>
-
-            <div className="chapter-list">
-              {chapters.map((ch, idx) => {
-                const dl = downloading[ch.url];
-                return (
-                  <div key={ch.url} className="chapter-row">
-                    <div className="chapter-row-info" onClick={() => openReader(ch, idx)} style={{ cursor: 'pointer' }}>
-                      <div className="chapter-row-title">{ch.title}</div>
-                      {ch.date && <div className="chapter-row-date">{ch.date}</div>}
-                      {dl && (
-                        <div className="progress-bar">
-                          <div className="progress-fill" style={{ width: `${(dl.current / dl.total) * 100}%` }} />
-                        </div>
-                      )}
-                    </div>
-
-                    {ch.readStatus === 'completed' && (
-                      <span className="chapter-row-badge badge-completed" title="Completed">✓</span>
-                    )}
-                    {ch.readStatus === 'reading' && (
-                      <span className="chapter-row-badge badge-reading" title="In progress">●</span>
-                    )}
-
-                    {ch.downloaded ? (
-                      <>
-                        <span className="chapter-row-badge badge-downloaded">Saved</span>
-                        <button className="btn btn-primary btn-sm" onClick={() => openReader(ch, idx)}>Read</button>
-                        <button className="btn btn-ghost btn-sm" onClick={() => deleteChapter(ch)} title="Delete">✕</button>
-                      </>
-                    ) : dl ? (
-                      <>
-                        <span className="chapter-row-badge badge-downloading">{dl.current}/{dl.total}</span>
-                        <button className="btn btn-secondary btn-sm" onClick={() => cancelDownload(ch.url)}>Cancel</button>
-                      </>
-                    ) : (
-                      <button className="btn btn-secondary btn-sm" onClick={() => downloadChapter(ch)}>↓ Save</button>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </>
-        )}
-
-        {!meta && !error && (
-          <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}>
+        ) : !error ? (
+          <div style={{ display: 'flex', justifyContent: 'center', padding: 16 }}>
             <div className="spinner" />
           </div>
+        ) : null}
+
+        {chapters.length > 0 && (
+          <div className="chapter-actions">
+            {lastReadChapter && (
+              <button
+                className="btn btn-accent btn-sm"
+                onClick={() => openReader(lastReadChapter.ch, lastReadChapter.idx)}
+              >
+                ▶ Continue
+              </button>
+            )}
+            {isDownloadingAll ? (
+              <button className="btn btn-secondary btn-sm" onClick={() => cancelAll(titleUrl)}>
+                Cancel
+              </button>
+            ) : (
+              <button className="btn btn-primary btn-sm" onClick={handleDownloadAll}>
+                Download All {downloadedCount > 0 ? `${downloadedCount}/${chapters.length}` : ''}
+              </button>
+            )}
+            <button className="btn btn-secondary btn-sm" onClick={openEditNames}>
+              Edit Names
+            </button>
+          </div>
         )}
+      </div>
+
+      <div className="scroll-area">
+        <div className="chapter-list">
+          {chapters.map((ch, idx) => {
+            const dl = downloads[ch.url];
+            return (
+              <div
+                key={ch.url}
+                className="chapter-row"
+                ref={(el) => { chapterRowRefs.current[ch.url] = el; }}
+              >
+                <div className="chapter-row-info" onClick={() => openReader(ch, idx)} style={{ cursor: 'pointer' }}>
+                  <div className="chapter-row-title">{ch.title}</div>
+                  {ch.date && <div className="chapter-row-date">{ch.date}</div>}
+                  {dl && (
+                    <div className="progress-bar">
+                      <div className="progress-fill" style={{ width: `${(dl.current / dl.total) * 100}%` }} />
+                    </div>
+                  )}
+                </div>
+
+                {ch.readStatus === 'completed' && (
+                  <span className="chapter-row-badge badge-completed" title="Completed">✓</span>
+                )}
+                {ch.readStatus === 'reading' && (
+                  <span className="chapter-row-badge badge-reading" title="In progress">●</span>
+                )}
+
+                {ch.downloaded ? (
+                  <>
+                    <span className="chapter-row-badge badge-downloaded">Saved</span>
+                    <button className="btn btn-primary btn-sm" onClick={() => openReader(ch, idx)}>Read</button>
+                    <button className="btn btn-ghost btn-sm" onClick={() => deleteChapter(ch)} title="Delete">✕</button>
+                  </>
+                ) : dl ? (
+                  <>
+                    <span className="chapter-row-badge badge-downloading">{dl.current}/{dl.total}</span>
+                    <button className="btn btn-secondary btn-sm" onClick={() => cancelDownload(ch.url)}>Cancel</button>
+                  </>
+                ) : (
+                  <button className="btn btn-secondary btn-sm" onClick={() => handleDownloadChapter(ch)}>↓ Save</button>
+                )}
+              </div>
+            );
+          })}
+        </div>
       </div>
 
       {showEditNames && (

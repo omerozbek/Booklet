@@ -1,14 +1,22 @@
 import { useState, useEffect, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { getChapterImages, saveChapterReadStatus } from '../db';
+import {
+  getChapterImages,
+  saveChapterReadStatus,
+  getChaptersForTitle,
+  deleteChapterImages,
+  getScrollPosition,
+  setScrollPosition,
+} from '../db';
 
-const CIRCUMFERENCE = 2 * Math.PI * 20; // r=20
+const CIRCUMFERENCE = 2 * Math.PI * 20;
 
 export default function Reader() {
   const { state } = useLocation();
   const navigate = useNavigate();
-  const { chapterUrl, titleUrl, chapters = [], startIndex = 0 } = state || {};
+  const { chapterUrl, titleUrl, chapters: navChapters = [], startIndex = 0 } = state || {};
 
+  const [chapters, setChapters] = useState(navChapters);
   const [images, setImages] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -19,15 +27,71 @@ export default function Reader() {
   const overlayTimer = useRef(null);
   const nextTriggerRef = useRef(false);
   const nextProgressRef = useRef(0);
+  const scrollRestoredRef = useRef(false);
+  const scrollSaveTimer = useRef(null);
+  const chaptersLoadedRef = useRef(navChapters.length > 0);
+
   const currentChapter = chapters[currentChapterIdx];
   const hasNext = currentChapterIdx < chapters.length - 1;
 
+  // Load chapters from DB if navigated without a chapter list (e.g. from "Continue" button)
   useEffect(() => {
+    if (chaptersLoadedRef.current || !titleUrl) return;
+    getChaptersForTitle(titleUrl).then((chs) => {
+      chaptersLoadedRef.current = true;
+      setChapters(chs);
+      if (chapterUrl) {
+        const idx = chs.findIndex((c) => c.url === chapterUrl);
+        if (idx >= 0 && idx !== currentChapterIdx) {
+          setCurrentChapterIdx(idx);
+        }
+      }
+    });
+  }, []);
+
+  // Load chapter images whenever the current chapter changes
+  useEffect(() => {
+    scrollRestoredRef.current = false;
     nextTriggerRef.current = false;
     setNextProgress(0);
     if (!currentChapter) return;
     loadChapter(currentChapter);
-  }, [currentChapterIdx]);
+  }, [currentChapterIdx, currentChapter?.url]);
+
+  // Restore scroll position after images load
+  useEffect(() => {
+    if (loading || !images.length || scrollRestoredRef.current || !currentChapter) return;
+    scrollRestoredRef.current = true;
+    const saved = getScrollPosition(currentChapter.url);
+    if (saved > 0) {
+      setTimeout(() => window.scrollTo(0, saved), 150);
+    }
+  }, [loading, images.length]);
+
+  // Save scroll position (debounced)
+  useEffect(() => {
+    if (loading || !currentChapter) return;
+    function onScroll() {
+      clearTimeout(scrollSaveTimer.current);
+      scrollSaveTimer.current = setTimeout(() => {
+        setScrollPosition(currentChapter.url, window.scrollY);
+      }, 400);
+    }
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      clearTimeout(scrollSaveTimer.current);
+      window.removeEventListener('scroll', onScroll);
+    };
+  }, [loading, currentChapter?.url]);
+
+  // Track last read chapter for the Library "Continue" button
+  useEffect(() => {
+    if (!currentChapter || !titleUrl) return;
+    localStorage.setItem(
+      'last-read',
+      JSON.stringify({ chapterUrl: currentChapter.url, chapterTitle: currentChapter.title, titleUrl })
+    );
+  }, [currentChapter?.url, titleUrl]);
 
   useEffect(() => {
     if (showOverlay) {
@@ -40,7 +104,6 @@ export default function Reader() {
   // Scroll-to-next detection
   useEffect(() => {
     if (loading || !hasNext) return;
-
     const ZONE = 240;
 
     function onScroll() {
@@ -56,7 +119,7 @@ export default function Reader() {
       if (nextProgressRef.current >= 1 && !nextTriggerRef.current) {
         nextTriggerRef.current = true;
         saveChapterReadStatus(currentChapter.url, 'completed');
-        goToChapter(currentChapterIdx + 1);
+        goToChapter(currentChapterIdx + 1, true);
       }
     }
 
@@ -67,6 +130,12 @@ export default function Reader() {
       window.removeEventListener('touchend', onTouchEnd);
     };
   }, [loading, currentChapterIdx, chapters.length, hasNext, images.length]);
+
+  useEffect(() => {
+    return () => {
+      images.forEach((img) => { if (img.isBlob) URL.revokeObjectURL(img.src); });
+    };
+  }, [images]);
 
   async function loadChapter(chapter) {
     setLoading(true);
@@ -100,24 +169,33 @@ export default function Reader() {
     }
   }
 
-  useEffect(() => {
-    return () => {
-      images.forEach((img) => { if (img.isBlob) URL.revokeObjectURL(img.src); });
-    };
-  }, [images]);
+  function triggerAutoDelete(fromIdx) {
+    try {
+      const settings = JSON.parse(localStorage.getItem('auto-delete') || '{}');
+      if (!settings.enabled) return;
+      const delay = settings.delay ?? 0;
+      const deleteIdx = fromIdx - delay;
+      if (deleteIdx >= 0 && chapters[deleteIdx]?.downloaded) {
+        deleteChapterImages(chapters[deleteIdx].url);
+      }
+    } catch {}
+  }
 
   function toggleOverlay() {
     setShowOverlay((v) => !v);
   }
 
-  function goToChapter(idx) {
+  function goToChapter(idx, completed = false) {
     if (idx < 0 || idx >= chapters.length) return;
+    if (completed) {
+      triggerAutoDelete(currentChapterIdx);
+    }
     window.scrollTo(0, 0);
     setCurrentChapterIdx(idx);
     setShowOverlay(true);
   }
 
-  if (!currentChapter) {
+  if (!currentChapter && chapters.length === 0) {
     return (
       <div className="reader" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)' }}>
         <p>No chapter selected.</p>
@@ -125,9 +203,16 @@ export default function Reader() {
     );
   }
 
+  if (!currentChapter) {
+    return (
+      <div className="reader" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <div className="spinner" style={{ width: 36, height: 36, borderWidth: 3 }} />
+      </div>
+    );
+  }
+
   return (
     <div className="reader" onClick={toggleOverlay}>
-      {/* Top overlay */}
       <div className={`reader-overlay ${showOverlay ? '' : 'hidden'}`} onClick={(e) => e.stopPropagation()}>
         <button
           className="btn btn-icon"
@@ -139,7 +224,6 @@ export default function Reader() {
         <span className="reader-title">{currentChapter.title}</span>
       </div>
 
-      {/* Images */}
       {loading ? (
         <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '50dvh' }}>
           <div className="spinner" style={{ width: 36, height: 36, borderWidth: 3 }} />
@@ -154,7 +238,6 @@ export default function Reader() {
             <LazyImage key={img.src} src={img.src} index={i} />
           ))}
 
-          {/* Pull-to-next zone */}
           {hasNext ? (
             <div className="reader-next-zone">
               <svg width="52" height="52" viewBox="0 0 48 48">
@@ -184,7 +267,6 @@ export default function Reader() {
         </div>
       )}
 
-      {/* Bottom overlay: chapter nav */}
       <div className={`reader-footer ${showOverlay ? '' : 'hidden'}`} onClick={(e) => e.stopPropagation()}>
         <button
           className="btn btn-secondary btn-sm"

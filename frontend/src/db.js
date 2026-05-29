@@ -102,3 +102,32 @@ export async function deleteChapterImages(chapterUrl) {
   if (ch) tx.objectStore('chapters').put({ ...ch, downloaded: false, imageCount: 0 });
   await tx.done;
 }
+
+export async function getStorageByTitle() {
+  const db = await getDb();
+  const titles = await db.getAll('titles');
+  const result = [];
+  for (const title of titles) {
+    const chapters = await db.getAllFromIndex('chapters', 'titleUrl', title.url);
+    let bytes = 0;
+    for (const ch of chapters) {
+      const imgs = await db.getAllFromIndex('images', 'chapterUrl', ch.url);
+      bytes += imgs.reduce((sum, img) => sum + (img.blob?.size || 0), 0);
+    }
+    result.push({
+      url: title.url,
+      title: title.title,
+      bytes,
+      downloadedChapters: chapters.filter((c) => c.downloaded).length,
+    });
+  }
+  return result;
+}
+
+export function getScrollPosition(chapterUrl) {
+  return parseInt(localStorage.getItem(`scroll:${chapterUrl}`) || '0', 10);
+}
+
+export function setScrollPosition(chapterUrl, y) {
+  localStorage.setItem(`scroll:${chapterUrl}`, String(Math.floor(y)));
+}
