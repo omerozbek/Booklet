@@ -35,7 +35,6 @@ html, body, #root {
   display: flex;
   flex-direction: column;
   min-height: 100dvh;
-  padding-top: var(--safe-top);
   padding-bottom: var(--safe-bottom);
 }
 
@@ -57,6 +56,15 @@ html, body, #root {
   font-size: 15px;
   font-weight: 700;
   letter-spacing: -0.2px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.topbar-logo {
+  width: 24px;
+  height: 24px;
+  border-radius: 5px;
 }
 
 .scroll-area {

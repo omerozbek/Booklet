@@ -18,6 +18,12 @@ const domainCookies = new Map();
 app.use(cors());
 app.use(express.json());
 
+// Serve apple-touch-icon explicitly so iOS always gets the real file
+app.get('/apple-touch-icon.png', (req, res) => {
+  res.set('Cache-Control', 'no-cache');
+  res.sendFile(path.join(__dirname, '../frontend/dist/apple-touch-icon.png'));
+});
+
 // Serve built frontend in production
 app.use(express.static(path.join(__dirname, '../frontend/dist')));
 

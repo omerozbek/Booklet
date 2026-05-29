@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getAllTitles, deleteTitle } from '../db';
 import AddTitle from '../components/AddTitle';
+import logoUrl from '/icon.svg';
 
 export default function Library() {
   const [titles, setTitles] = useState([]);
@@ -33,7 +34,10 @@ export default function Library() {
   return (
     <div className="page">
       <div className="topbar">
-        <span className="topbar-title">Manhwa Reader</span>
+        <span className="topbar-title">
+          <img src={logoUrl} alt="" className="topbar-logo" />
+          Booklet
+        </span>
         <button
           className="btn btn-ghost btn-sm"
           style={{ fontSize: 18, padding: '4px 8px' }}
