@@ -1,11 +1,13 @@
 const ComixToScraper = require('./comixto');
 const Logging10000Scraper = require('./logging10000');
+const GreatestEstateDeveloperScraper = require('./greatestestatedeveloper');
 
 // Map hostname → scraper instance
 // Add new sites here as you discover them
 const scrapers = {
   'comix.to': new ComixToScraper(),
   'logging10000yearsintothefuture.org': new Logging10000Scraper(),
+  'w21.greatestestatedeveloper.org': new GreatestEstateDeveloperScraper(),
 };
 
 const defaultScraper = new ComixToScraper();

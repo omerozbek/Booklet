@@ -115,14 +115,27 @@ class ComixToScraper extends BaseScraper {
 
   async fetchChapter(url) {
     const page = await this._openPage(url);
+    const bufferPromises = [];
+    // Track final (post-redirect) URL → original request URL so cache lookups work
+    const responseUrlToRequestUrl = new Map();
+
     try {
-      // Capture image responses as they load — must be synchronous, buffer() called immediately
       page.on('response', (response) => {
         const ct = response.headers()['content-type'] || '';
         if (!response.ok() || !ct.startsWith('image/')) return;
-        response.buffer()
-          .then(buf => imageCache.set(response.url(), buf, ct))
+        const responseUrl = response.url();
+        const p = response.buffer()
+          .then(buf => {
+            imageCache.set(responseUrl, buf, ct);
+            // Also cache under the request URL (before any redirect) if different
+            const reqUrl = response.request()?.url();
+            if (reqUrl && reqUrl !== responseUrl) {
+              imageCache.set(reqUrl, buf, ct);
+              responseUrlToRequestUrl.set(responseUrl, reqUrl);
+            }
+          })
           .catch(() => {});
+        bufferPromises.push(p);
       });
 
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 40000 });
@@ -163,6 +176,9 @@ class ComixToScraper extends BaseScraper {
           console.log(`[chapter] inferred ${images.length} URLs from pattern, start=${start}`);
         }
       }
+
+      // Wait for all in-flight buffer() calls to finish before closing the page
+      await Promise.allSettled(bufferPromises);
 
       const cached = images.filter(u => imageCache.get(u)).length;
       console.log(`[chapter] ${images.length} URLs, ${cached} already cached, first: ${images[0]}`);

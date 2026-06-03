@@ -29,6 +29,7 @@ export default function Reader() {
   const nextProgressRef = useRef(0);
   const scrollRestoredRef = useRef(false);
   const scrollSaveTimer = useRef(null);
+  const lastScrollY = useRef(0);
   const chaptersLoadedRef = useRef(navChapters.length > 0);
 
   const currentChapter = chapters[currentChapterIdx];
@@ -63,24 +64,48 @@ export default function Reader() {
     if (loading || !images.length || scrollRestoredRef.current || !currentChapter) return;
     scrollRestoredRef.current = true;
     const saved = getScrollPosition(currentChapter.url);
-    if (saved > 0) {
-      setTimeout(() => window.scrollTo(0, saved), 150);
-    }
+    if (saved <= 0) return;
+    let attempts = 0;
+    const tryScroll = () => {
+      if (document.documentElement.scrollHeight >= saved + window.innerHeight * 0.5 || attempts >= 20) {
+        window.scrollTo(0, saved);
+      } else {
+        attempts++;
+        setTimeout(tryScroll, 100);
+      }
+    };
+    setTimeout(tryScroll, 50);
   }, [loading, images.length]);
 
-  // Save scroll position (debounced)
+  // Save scroll position on scroll (debounced) and when navigating away or app is hidden
   useEffect(() => {
     if (loading || !currentChapter) return;
-    function onScroll() {
-      clearTimeout(scrollSaveTimer.current);
-      scrollSaveTimer.current = setTimeout(() => {
-        setScrollPosition(currentChapter.url, window.scrollY);
-      }, 400);
+    const url = currentChapter.url;
+
+    function save() {
+      if (lastScrollY.current > 0) setScrollPosition(url, lastScrollY.current);
     }
+
+    function onScroll() {
+      lastScrollY.current = window.scrollY;
+      clearTimeout(scrollSaveTimer.current);
+      scrollSaveTimer.current = setTimeout(save, 300);
+    }
+
+    function onVisibilityChange() {
+      if (document.visibilityState === 'hidden') {
+        clearTimeout(scrollSaveTimer.current);
+        save();
+      }
+    }
+
     window.addEventListener('scroll', onScroll, { passive: true });
+    document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       clearTimeout(scrollSaveTimer.current);
+      save(); // save using lastScrollY, not window.scrollY (which may already be 0)
       window.removeEventListener('scroll', onScroll);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, [loading, currentChapter?.url]);
 
