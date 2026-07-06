@@ -71,6 +71,20 @@ app.get('/api/proxy', async (req, res) => {
   const { url, referer } = req.query;
   if (!url) return res.status(400).json({ error: 'url parameter required' });
 
+  // Self-contained data: URLs (e.g. placeholder pages) — decode and serve as-is.
+  if (url.startsWith('data:')) {
+    const m = url.match(/^data:([^;,]*)(;base64)?,([\s\S]*)$/);
+    if (m) {
+      const [, contentType, base64, data] = m;
+      const buffer = base64 ? Buffer.from(data, 'base64') : Buffer.from(decodeURIComponent(data), 'utf8');
+      res.set('Content-Type', contentType || 'application/octet-stream');
+      res.set('Cache-Control', 'public, max-age=604800');
+      res.set('Access-Control-Allow-Origin', '*');
+      return res.send(buffer);
+    }
+    return res.status(400).json({ error: 'Invalid data URL' });
+  }
+
   const origin = new URL(url).origin;
   const hostname = new URL(url).hostname;
 

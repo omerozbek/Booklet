@@ -29,7 +29,10 @@ export default function Reader() {
   const nextProgressRef = useRef(0);
   const scrollRestoredRef = useRef(false);
   const scrollSaveTimer = useRef(null);
-  const lastScrollY = useRef(0);
+  // Last position the user actually scrolled to, tagged with its chapter url
+  // so it can never be saved under a different chapter's key.
+  const lastPosRef = useRef(null);
+  const imagesContainerRef = useRef(null);
   const chaptersLoadedRef = useRef(navChapters.length > 0);
 
   const currentChapter = chapters[currentChapterIdx];
@@ -54,27 +57,71 @@ export default function Reader() {
   useEffect(() => {
     scrollRestoredRef.current = false;
     nextTriggerRef.current = false;
+    lastPosRef.current = null;
     setNextProgress(0);
     if (!currentChapter) return;
     loadChapter(currentChapter);
   }, [currentChapterIdx, currentChapter?.url]);
+
+  // Topmost visible image (index + how far into it we've scrolled). Anchoring
+  // on an image survives lazy-load layout shifts, unlike a raw pixel offset.
+  function captureAnchor() {
+    const container = imagesContainerRef.current;
+    if (!container) return null;
+    const wrappers = container.querySelectorAll('.reader-img');
+    for (let i = 0; i < wrappers.length; i++) {
+      const rect = wrappers[i].getBoundingClientRect();
+      if (rect.bottom > 0) {
+        const frac = rect.height > 0 ? Math.max(0, -rect.top / rect.height) : 0;
+        return { index: i, frac };
+      }
+    }
+    return null;
+  }
 
   // Restore scroll position after images load
   useEffect(() => {
     if (loading || !images.length || scrollRestoredRef.current || !currentChapter) return;
     scrollRestoredRef.current = true;
     const saved = getScrollPosition(currentChapter.url);
-    if (saved <= 0) return;
+    const hasPosition = saved && (saved.index > 0 || saved.frac > 0 || saved.y > 0);
+    if (!hasPosition) {
+      window.scrollTo(0, 0); // fresh chapter always starts at the top
+      return;
+    }
+
+    let cancelled = false;
     let attempts = 0;
-    const tryScroll = () => {
-      if (document.documentElement.scrollHeight >= saved + window.innerHeight * 0.5 || attempts >= 20) {
-        window.scrollTo(0, saved);
-      } else {
-        attempts++;
-        setTimeout(tryScroll, 100);
+    const cancel = () => { cancelled = true; };
+
+    function target() {
+      if (saved.index != null) {
+        const el = imagesContainerRef.current?.querySelectorAll('.reader-img')[saved.index];
+        if (el) {
+          const rect = el.getBoundingClientRect();
+          return window.scrollY + rect.top + (saved.frac || 0) * rect.height;
+        }
       }
+      return saved.y || 0; // legacy pixel-only positions
+    }
+
+    // Images load in and change layout for a while, so keep correcting the
+    // position until it settles — but stop as soon as the user scrolls.
+    function settle() {
+      if (cancelled) return;
+      const t = target();
+      if (Math.abs(window.scrollY - t) > 2) window.scrollTo(0, t);
+      if (++attempts < 25) setTimeout(settle, 120);
+    }
+
+    window.addEventListener('touchstart', cancel, { once: true, passive: true });
+    window.addEventListener('wheel', cancel, { once: true, passive: true });
+    setTimeout(settle, 50);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('touchstart', cancel);
+      window.removeEventListener('wheel', cancel);
     };
-    setTimeout(tryScroll, 50);
   }, [loading, images.length]);
 
   // Save scroll position on scroll (debounced) and when navigating away or app is hidden
@@ -83,11 +130,22 @@ export default function Reader() {
     const url = currentChapter.url;
 
     function save() {
-      if (lastScrollY.current > 0) setScrollPosition(url, lastScrollY.current);
+      const pos = lastPosRef.current;
+      if (!pos || pos.url !== url) return; // never write another chapter's position
+      setScrollPosition(url, { y: pos.y, index: pos.index, frac: pos.frac });
     }
 
     function onScroll() {
-      lastScrollY.current = window.scrollY;
+      // Ignore programmatic scrolls while a chapter is loading/restoring;
+      // only positions the user actually scrolled to get recorded.
+      if (!scrollRestoredRef.current) return;
+      const anchor = captureAnchor();
+      lastPosRef.current = {
+        url,
+        y: window.scrollY,
+        index: anchor ? anchor.index : null,
+        frac: anchor ? anchor.frac : 0,
+      };
       clearTimeout(scrollSaveTimer.current);
       scrollSaveTimer.current = setTimeout(save, 300);
     }
@@ -103,7 +161,7 @@ export default function Reader() {
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       clearTimeout(scrollSaveTimer.current);
-      save(); // save using lastScrollY, not window.scrollY (which may already be 0)
+      save(); // save using lastPosRef, not window.scrollY (which may already be 0)
       window.removeEventListener('scroll', onScroll);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
@@ -214,7 +272,13 @@ export default function Reader() {
     if (idx < 0 || idx >= chapters.length) return;
     if (completed) {
       triggerAutoDelete(currentChapterIdx);
+      // Finished chapters restart from the top if reopened
+      if (currentChapter) setScrollPosition(currentChapter.url, { y: 0, index: 0, frac: 0 });
+      lastPosRef.current = null;
     }
+    // Stop recording scroll events until the next chapter has restored,
+    // so the scroll-to-top below can't be saved as a reading position.
+    scrollRestoredRef.current = false;
     window.scrollTo(0, 0);
     setCurrentChapterIdx(idx);
     setShowOverlay(true);
@@ -258,7 +322,7 @@ export default function Reader() {
           <div className="error-banner">{error}</div>
         </div>
       ) : (
-        <div className="reader-images">
+        <div className="reader-images" ref={imagesContainerRef}>
           {images.map((img, i) => (
             <LazyImage key={img.src} src={img.src} index={i} />
           ))}

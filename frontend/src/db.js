@@ -124,10 +124,162 @@ export async function getStorageByTitle() {
   return result;
 }
 
+// Positions are stored as { y, index, frac }: raw pixel offset plus an anchor
+// (topmost visible image index + fraction scrolled into it). Older versions
+// stored a bare pixel number — still readable as { y }.
 export function getScrollPosition(chapterUrl) {
-  return parseInt(localStorage.getItem(`scroll:${chapterUrl}`) || '0', 10);
+  try {
+    const raw = localStorage.getItem(`scroll:${chapterUrl}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === 'number') return { y: parsed, index: null, frac: 0 };
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
-export function setScrollPosition(chapterUrl, y) {
-  localStorage.setItem(`scroll:${chapterUrl}`, String(Math.floor(y)));
+export function setScrollPosition(chapterUrl, pos) {
+  localStorage.setItem(
+    `scroll:${chapterUrl}`,
+    JSON.stringify({ y: Math.floor(pos.y || 0), index: pos.index ?? null, frac: pos.frac || 0 })
+  );
+}
+
+// ─── Backup / Migration ────────────────────
+//
+// IndexedDB is scoped per-origin, so downloads saved under one URL are
+// invisible from another (e.g. a new local IP, or dev :5173 vs prod :3001).
+// These helpers move a whole library between origins via a single file.
+//
+// File layout (binary, no base64 so image bytes aren't inflated):
+//   [4 bytes: header JSON length, uint32 little-endian]
+//   [header JSON, UTF-8]
+//   [all image blobs concatenated, raw]
+// The header lists titles, chapters, and an image table with byte offsets,
+// so import can re-slice each image straight from the file without ever
+// holding the whole library in memory.
+
+const BACKUP_FORMAT = 'manhwa-reader-backup';
+
+// Reading state lives in localStorage, not IndexedDB: the Continue button's
+// last-read chapter, per-chapter scroll positions, and auto-delete settings.
+function collectLocalState() {
+  const state = {};
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key === 'last-read' || key === 'auto-delete' || key.startsWith('scroll:')) {
+      state[key] = localStorage.getItem(key);
+    }
+  }
+  return state;
+}
+
+export async function exportData() {
+  const db = await getDb();
+  const [titles, chapters, images] = await Promise.all([
+    db.getAll('titles'),
+    db.getAll('chapters'),
+    db.getAll('images'),
+  ]);
+
+  const imageTable = [];
+  const blobParts = [];
+  let offset = 0;
+  for (const img of images) {
+    const blob = img.blob;
+    const length = blob?.size || 0;
+    imageTable.push({
+      id: img.id,
+      chapterUrl: img.chapterUrl,
+      index: img.index,
+      type: blob?.type || 'image/jpeg',
+      offset,
+      length,
+    });
+    if (length > 0) blobParts.push(blob);
+    offset += length;
+  }
+
+  const header = {
+    format: BACKUP_FORMAT,
+    version: 2,
+    exportedAt: Date.now(),
+    titles,
+    chapters,
+    images: imageTable,
+    localState: collectLocalState(),
+  };
+  const headerBytes = new TextEncoder().encode(JSON.stringify(header));
+  const lenPrefix = new Uint8Array(4);
+  new DataView(lenPrefix.buffer).setUint32(0, headerBytes.length, true);
+
+  // Blob() keeps each part by reference, so the image bytes are streamed
+  // from IndexedDB-backed storage rather than copied into JS memory.
+  return new Blob([lenPrefix, headerBytes, ...blobParts], {
+    type: 'application/octet-stream',
+  });
+}
+
+export async function importData(file, onProgress) {
+  const lenBuf = await file.slice(0, 4).arrayBuffer();
+  const headerLen = new DataView(lenBuf).getUint32(0, true);
+  if (!headerLen || headerLen > file.size) {
+    throw new Error('Not a valid backup file');
+  }
+  const header = JSON.parse(await file.slice(4, 4 + headerLen).text());
+  if (header.format !== BACKUP_FORMAT) {
+    throw new Error('Not a valid backup file');
+  }
+
+  const dataStart = 4 + headerLen;
+  const db = await getDb();
+
+  // Metadata is small — write titles + chapters in one transaction.
+  // Chapters merge with any existing record: imported read state wins, but a
+  // chapter already downloaded on this origin stays marked as downloaded.
+  const metaTx = db.transaction(['titles', 'chapters'], 'readwrite');
+  for (const t of header.titles || []) metaTx.objectStore('titles').put(t);
+  for (const c of header.chapters || []) {
+    const existing = await metaTx.objectStore('chapters').get(c.url);
+    metaTx.objectStore('chapters').put(
+      existing
+        ? {
+            ...existing,
+            ...c,
+            downloaded: existing.downloaded || c.downloaded || false,
+            imageCount: Math.max(existing.imageCount || 0, c.imageCount || 0),
+          }
+        : c
+    );
+  }
+  await metaTx.done;
+
+  // Restore reading state (Continue button, scroll positions, settings)
+  for (const [key, value] of Object.entries(header.localState || {})) {
+    localStorage.setItem(key, value);
+  }
+
+  // Images can be large — write in small batches, slicing each blob straight
+  // from the file (zero-copy) so memory stays flat regardless of library size.
+  const images = header.images || [];
+  const BATCH = 25;
+  for (let i = 0; i < images.length; i += BATCH) {
+    const batch = images.slice(i, i + BATCH);
+    const tx = db.transaction('images', 'readwrite');
+    const store = tx.objectStore('images');
+    for (const meta of batch) {
+      const start = dataStart + meta.offset;
+      const blob = file.slice(start, start + meta.length, meta.type);
+      store.put({ id: meta.id, chapterUrl: meta.chapterUrl, index: meta.index, blob });
+    }
+    await tx.done;
+    onProgress?.(Math.min(i + BATCH, images.length), images.length);
+  }
+
+  return {
+    titles: (header.titles || []).length,
+    chapters: (header.chapters || []).length,
+    images: images.length,
+  };
 }

@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getStorageByTitle } from '../db';
+import { getStorageByTitle, exportData, importData } from '../db';
 
 function formatBytes(bytes) {
   if (bytes === 0) return '0 B';
@@ -22,16 +22,73 @@ export default function Settings() {
   const [storage, setStorage] = useState([]);
   const [loadingStorage, setLoadingStorage] = useState(true);
   const [autoDelete, setAutoDelete] = useState(loadAutoDelete);
+  const [busy, setBusy] = useState(null); // 'export' | 'import' | null
+  const [migrateMsg, setMigrateMsg] = useState('');
+  const fileInputRef = useRef(null);
 
   const enabled = autoDelete.enabled || false;
   const delay = autoDelete.delay ?? 0;
 
-  useEffect(() => {
-    getStorageByTitle().then((data) => {
+  function refreshStorage() {
+    return getStorageByTitle().then((data) => {
       setStorage(data);
       setLoadingStorage(false);
     });
+  }
+
+  useEffect(() => {
+    refreshStorage();
   }, []);
+
+  async function handleExport() {
+    setBusy('export');
+    setMigrateMsg('');
+    try {
+      const blob = await exportData();
+      if (blob.size <= 4) {
+        setMigrateMsg('Nothing to export yet.');
+        return;
+      }
+      const url = URL.createObjectURL(blob);
+      const date = new Date().toISOString().slice(0, 10);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `manhwa-backup-${date}.manhwabak`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      setMigrateMsg(`Exported ${formatBytes(blob.size)}. Save it, then import on the other URL.`);
+    } catch (err) {
+      setMigrateMsg(`Export failed: ${err.message}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleImportFile(e) {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-importing the same file
+    if (!file) return;
+    setBusy('import');
+    setMigrateMsg('Reading backup…');
+    try {
+      const result = await importData(file, (done, total) => {
+        setMigrateMsg(`Importing images… ${done}/${total}`);
+      });
+      await refreshStorage();
+      setMigrateMsg(
+        `Imported ${result.titles} title${result.titles !== 1 ? 's' : ''}, ` +
+          `${result.chapters} chapter${result.chapters !== 1 ? 's' : ''}, ` +
+          `${result.images} image${result.images !== 1 ? 's' : ''}` +
+          ` — reading progress included.`
+      );
+    } catch (err) {
+      setMigrateMsg(`Import failed: ${err.message}`);
+    } finally {
+      setBusy(null);
+    }
+  }
 
   function saveAutoDelete(updates) {
     const next = { ...autoDelete, ...updates };
@@ -125,6 +182,52 @@ export default function Settings() {
                 </div>
               ))}
             </>
+          )}
+        </section>
+
+        <section className="settings-section">
+          <h2 className="settings-section-title">Backup &amp; Migrate</h2>
+
+          <div className="settings-row">
+            <div className="settings-row-text">
+              <div className="settings-row-label">Move downloads to another URL</div>
+              <div className="settings-row-desc">
+                Downloads are stored per-URL. If you open the app from a different
+                address (new IP, or :5173 vs :3001), export here, then import on the
+                other URL. Everything moves with it: downloaded chapters, read /
+                in-progress marks, scroll positions, and the Continue button.
+                Importing merges — it won't erase existing downloads.
+              </div>
+            </div>
+          </div>
+
+          <div className="settings-row" style={{ gap: 10 }}>
+            <button
+              className="btn btn-secondary"
+              onClick={handleExport}
+              disabled={busy !== null}
+            >
+              {busy === 'export' ? 'Exporting…' : 'Export'}
+            </button>
+            <button
+              className="btn btn-primary"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={busy !== null}
+            >
+              {busy === 'import' ? 'Importing…' : 'Import'}
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              onChange={handleImportFile}
+              style={{ display: 'none' }}
+            />
+          </div>
+
+          {migrateMsg && (
+            <div className="settings-row-desc" style={{ padding: '0 4px' }}>
+              {migrateMsg}
+            </div>
           )}
         </section>
       </div>

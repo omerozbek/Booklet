@@ -1,16 +1,23 @@
 const ComixToScraper = require('./comixto');
 const Logging10000Scraper = require('./logging10000');
 const GreatestEstateDeveloperScraper = require('./greatestestatedeveloper');
+const AsuraScansScraper = require('./asurascans');
+const GenericScraper = require('./generic');
 
-// Map hostname → scraper instance
-// Add new sites here as you discover them
+// Map hostname → dedicated scraper instance. Hosts listed here get purpose-built
+// handling; anything else falls back to the GenericScraper below.
+const asuraScraper = new AsuraScansScraper();
 const scrapers = {
   'comix.to': new ComixToScraper(),
   'logging10000yearsintothefuture.org': new Logging10000Scraper(),
   'w21.greatestestatedeveloper.org': new GreatestEstateDeveloperScraper(),
+  'asurascans.com': asuraScraper,
+  'asuracomic.net': asuraScraper, // legacy domain → same handler
 };
 
-const defaultScraper = new ComixToScraper();
+// Default for unknown hosts: best-effort generic scraper (Madara / Themesia /
+// server-rendered themes, with a headless-browser fallback).
+const defaultScraper = new GenericScraper();
 
 function getScraper(url) {
   try {

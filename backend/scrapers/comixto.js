@@ -4,6 +4,20 @@ const imageCache = require('../imageCache');
 
 const BASE = 'https://comix.to';
 
+// comix.to renders roughly every 10th page onto a <canvas> (a 2D context whose
+// pixels can't be read back) instead of an <img>, as an anti-scraping measure.
+// Those pages have no retrievable URL, so we substitute a labelled placeholder
+// to keep the page order and count intact and make the gap visible.
+function protectedPagePlaceholder(pageLabel) {
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1200" viewBox="0 0 800 1200">` +
+    `<rect width="800" height="1200" fill="#15161a"/>` +
+    `<text x="400" y="580" fill="#8a8d98" font-family="sans-serif" font-size="36" text-anchor="middle">Page ${pageLabel}</text>` +
+    `<text x="400" y="640" fill="#5b5e68" font-family="sans-serif" font-size="24" text-anchor="middle">protected by comix.to — unavailable</text>` +
+    `</svg>`;
+  return 'data:image/svg+xml;base64,' + Buffer.from(svg, 'utf8').toString('base64');
+}
+
 class ComixToScraper extends BaseScraper {
   constructor() { super(BASE); }
 
@@ -55,60 +69,55 @@ class ComixToScraper extends BaseScraper {
   async _scrapeAllChapterPages(page) {
     const seen = new Map(); // chapter number → chapter object
 
-    let pageNum = 1;
-    while (true) {
-      // Extract all chapter rows on current page
-      const rows = await page.evaluate(() => {
-        return Array.from(document.querySelectorAll('.mchap-row')).map(row => {
+    // Walk every pager page. Termination is driven by the active-page indicator
+    // (.npager__num.is-active): when clicking Next no longer changes it, or the
+    // Next button is gone, we've reached the last page. This is more reliable
+    // than diffing row hrefs, which can repeat across pages of the same chapter.
+    let activePrev = null;
+    for (let guard = 0; guard < 500; guard++) {
+      const state = await page.evaluate(() => {
+        const rows = Array.from(document.querySelectorAll('.mchap-row')).map(row => {
           const a = row.querySelector('a[href*="-chapter-"]');
           if (!a) return null;
-          const href = a.href;
-          const numMatch = href.match(/-chapter-([\d.]+)/);
           return {
-            url: href,
-            number: numMatch ? parseFloat(numMatch[1]) : null,
-            title: a.querySelector('.mchap-row__ch')?.textContent.trim() ||
-                   a.textContent.trim(),
+            url: a.href,
+            title: a.querySelector('.mchap-row__ch')?.textContent.trim() || a.textContent.trim(),
           };
         }).filter(Boolean);
+        return {
+          rows,
+          active: document.querySelector('.npager__num.is-active')?.textContent?.trim() || null,
+          hasNext: !!document.querySelector('.npager__nav[aria-label="Next page"]:not([disabled])'),
+        };
       });
 
-      for (const ch of rows) {
-        const key = ch.number;
-        if (key !== null && !seen.has(key)) {
-          seen.set(key, ch);
+      for (const ch of state.rows) {
+        // Handle decimal chapters in either "-chapter-40-5" or "-chapter-40.5" form.
+        const m = ch.url.match(/-chapter-(\d+(?:[.-]\d+)?)/i);
+        const number = m ? parseFloat(m[1].replace('-', '.')) : null;
+        const key = number ?? ch.url; // fall back to the URL for unnumbered specials
+        if (!seen.has(key)) {
+          seen.set(key, { url: ch.url, number, title: ch.title || (number != null ? `Chapter ${number}` : ch.title) });
         }
       }
 
-      // Check if there's a next page
-      const hasNext = await page.evaluate(() => {
-        const btn = document.querySelector('.npager__nav[aria-label="Next page"]');
-        return btn && !btn.disabled;
-      });
+      // Stop if the page didn't advance since the last click, or there's no next.
+      if (activePrev !== null && state.active === activePrev) break;
+      activePrev = state.active;
+      if (!state.hasNext) break;
 
-      if (!hasNext) break;
-
-      // Click next page and wait for refresh
-      await page.evaluate(() => {
-        document.querySelector('.npager__nav[aria-label="Next page"]')?.click();
-      });
+      await page.evaluate(() => document.querySelector('.npager__nav[aria-label="Next page"]')?.click());
       await page.waitForFunction(
-        (prev) => {
-          const rows = document.querySelectorAll('.mchap-row');
-          if (rows.length === 0) return false;
-          const first = rows[0]?.querySelector('a')?.href;
-          return first !== prev;
-        },
-        {},
-        rows[0]?.url || ''
+        (prev) => (document.querySelector('.npager__num.is-active')?.textContent?.trim() || null) !== prev,
+        { timeout: 8000 },
+        state.active
       ).catch(() => {});
-      await new Promise(r => setTimeout(r, 200)); // small settle time
-
-      pageNum++;
-      if (pageNum > 200) break; // safety limit
+      await new Promise(r => setTimeout(r, 150));
     }
 
-    return [...seen.values()].sort((a, b) => (a.number ?? 0) - (b.number ?? 0));
+    return [...seen.values()]
+      .filter(c => c.number !== null) // drop rows we couldn't assign a number to
+      .sort((a, b) => a.number - b.number);
   }
 
   // ─── Chapter images (DOM scraping) ──────────────────────────────────────
@@ -116,72 +125,98 @@ class ComixToScraper extends BaseScraper {
   async fetchChapter(url) {
     const page = await this._openPage(url);
     const bufferPromises = [];
-    // Track final (post-redirect) URL → original request URL so cache lookups work
-    const responseUrlToRequestUrl = new Map();
 
     try {
+      // Cache every image the reader loads, keyed by URL, so the proxy can serve
+      // these session-bound CDN URLs without re-authenticating.
       page.on('response', (response) => {
         const ct = response.headers()['content-type'] || '';
         if (!response.ok() || !ct.startsWith('image/')) return;
         const responseUrl = response.url();
+        const requestUrl = response.request()?.url();
         const p = response.buffer()
           .then(buf => {
             imageCache.set(responseUrl, buf, ct);
-            // Also cache under the request URL (before any redirect) if different
-            const reqUrl = response.request()?.url();
-            if (reqUrl && reqUrl !== responseUrl) {
-              imageCache.set(reqUrl, buf, ct);
-              responseUrlToRequestUrl.set(responseUrl, reqUrl);
-            }
+            // Also cache under the pre-redirect request URL so a proxy lookup by
+            // the exact src the reader used still hits.
+            if (requestUrl && requestUrl !== responseUrl) imageCache.set(requestUrl, buf, ct);
           })
           .catch(() => {});
         bufferPromises.push(p);
       });
 
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 40000 });
-      await page.waitForSelector('.rpage-page__img', { timeout: 20000 });
+      await page.waitForSelector('.rpage-page', { timeout: 20000 });
 
-      const totalPages = await page.evaluate(() => {
-        const slides = document.querySelectorAll('.swiper-slide:not(.swiper-slide-duplicate)');
-        if (slides.length > 1) return slides.length;
-        return document.querySelectorAll('.rpage-page').length || 0;
-      });
+      // The long-strip reader is virtualised: it keeps only a handful of pages
+      // rendered at a time and lazy-loads each <img> as it nears the viewport.
+      // Every .rpage-page carries a stable data-page index, so we scroll the
+      // reader's own scroll container end-to-end, harvesting each page's URL by
+      // its index. This survives images being unloaded again once out of view.
+      const harvest = await page.evaluate(async () => {
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+        const scroller =
+          document.querySelector('.rpage-main--long-strip') ||
+          document.querySelector('.rpage-main') ||
+          document.scrollingElement;
+        const pages = Array.from(document.querySelectorAll('.rpage-page'));
+        const total = pages.length;
+        const dp = (el) => el.getAttribute('data-page') || null;
 
-      // Force all lazy images to load so the response interceptor captures them
-      await page.evaluate(() => {
-        document.querySelectorAll('.rpage-page__img').forEach(img => {
-          const src = img.dataset?.src || img.dataset?.lazySrc;
-          if (src && (!img.src || img.src === window.location.href)) img.src = src;
+        const map = {};              // data-page → url
+        const canvasPages = new Set();
+        const scan = () => document.querySelectorAll('.rpage-page').forEach(pg => {
+          const key = pg.getAttribute('data-page');
+          if (!key || map[key]) return;
+          const img = pg.querySelector('img');
+          if (img && img.src && img.src.startsWith('http')) map[key] = img.src;
+          else if (pg.querySelector('canvas')) canvasPages.add(key);
         });
-      });
-      // Wait for the triggered requests to complete
-      await page.waitForNetworkIdle({ idleTime: 1500, timeout: 20000 }).catch(() => {});
+        // Pages still worth chasing: no URL yet and not a (protected) canvas.
+        const remaining = () => pages.map(dp).filter(k => k && !map[k] && !canvasPages.has(k));
 
-      let images = await page.evaluate(() =>
-        Array.from(document.querySelectorAll('.rpage-page__img'))
-          .map(img => img.src || img.dataset?.src)
-          .filter(s => s && s.startsWith('http'))
-      );
-
-      if (!images.length) throw new Error('No images found in reader');
-
-      // Fill any gaps not loaded via DOM with URL pattern inference
-      if (images.length < totalPages) {
-        const firstSrc = images[0];
-        const baseMatch = firstSrc && firstSrc.match(/^(.+\/)(\d+)\.(webp|jpg|jpeg|png)$/i);
-        if (baseMatch) {
-          const [, base, startStr, ext] = baseMatch;
-          const start = parseInt(startStr, 10);
-          images = Array.from({ length: totalPages }, (_, i) => `${base}${start + i}.${ext}`);
-          console.log(`[chapter] inferred ${images.length} URLs from pattern, start=${start}`);
+        // Pass 1: fast sweep top to bottom to load the bulk of the pages.
+        const step = Math.max(500, Math.floor((scroller.clientHeight || 900) * 0.85));
+        for (let y = 0; y <= scroller.scrollHeight; y += step) {
+          scroller.scrollTop = y;
+          await sleep(150);
+          scan();
         }
-      }
+        // Passes 2..N: revisit each straggler individually and wait for it to
+        // actually load (canvas pages drop out of `remaining`, so we don't spin
+        // on the ~1-in-10 pages that never resolve to an image).
+        for (let round = 0; round < 4 && remaining().length; round++) {
+          for (const key of remaining()) {
+            const pg = document.querySelector(`.rpage-page[data-page="${key}"]`);
+            if (!pg) continue;
+            pg.scrollIntoView({ block: 'center' });
+            for (let t = 0; t < 15; t++) { // poll up to ~1.5s for this page
+              await sleep(100);
+              const img = pg.querySelector('img');
+              if ((img && img.src && img.src.startsWith('http')) || pg.querySelector('canvas')) break;
+            }
+            scan();
+          }
+        }
+        scan();
 
-      // Wait for all in-flight buffer() calls to finish before closing the page
+        const ordered = pages.map((pg, i) => {
+          const key = dp(pg) || String(i + 1);
+          return { page: key, url: map[key] || null, isCanvas: canvasPages.has(key) };
+        });
+        return { total, ordered, gotUrls: Object.keys(map).length };
+      });
+
+      // Let any in-flight image buffers finish caching before the page closes.
       await Promise.allSettled(bufferPromises);
 
-      const cached = images.filter(u => imageCache.get(u)).length;
-      console.log(`[chapter] ${images.length} URLs, ${cached} already cached, first: ${images[0]}`);
+      if (!harvest.gotUrls) throw new Error('No images found in reader');
+
+      // Assemble the ordered page list, substituting a placeholder for the
+      // canvas-protected pages we can't retrieve.
+      const images = harvest.ordered.map(p => p.url || protectedPagePlaceholder(p.page));
+      const protectedCount = harvest.ordered.filter(p => !p.url).length;
+      console.log(`[chapter] ${images.length} pages (${harvest.gotUrls} images, ${protectedCount} protected/placeholder)`);
 
       const cookies = await page.cookies();
       const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
@@ -189,19 +224,6 @@ class ComixToScraper extends BaseScraper {
       return { images, _cookieDomain: new URL(url).hostname, _cookies: cookieStr };
     } finally {
       await page.close().catch(() => {});
-    }
-  }
-
-  async _scrollToLoadAll(page, expected) {
-    let prev = 0;
-    for (let attempt = 0; attempt < 30; attempt++) {
-      await page.evaluate(() => window.scrollBy(0, window.innerHeight * 3));
-      await new Promise(r => setTimeout(r, 400));
-      const count = await page.evaluate(() =>
-        document.querySelectorAll('.rpage-page__img[src]:not([src=""])').length
-      );
-      if (count >= expected || count === prev) break;
-      prev = count;
     }
   }
 
