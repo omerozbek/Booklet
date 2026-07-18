@@ -30,7 +30,8 @@ async function getBrowser() {
   _browser = await puppeteer.launch({
     executablePath,
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--window-size=1280,900'],
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+           '--disable-blink-features=AutomationControlled', '--window-size=1280,900'],
   });
   _browser.on('disconnected', () => { _browser = null; });
   return _browser;

@@ -173,10 +173,17 @@ async function getOrCreateCert() {
   return { key: pems.private, cert: pems.cert };
 }
 
-getOrCreateCert().then((tlsCreds) => {
-  https.createServer(tlsCreds, app).listen(HTTPS_PORT, '0.0.0.0', () => {
-    console.log(` HTTPS → https://localhost:${HTTPS_PORT}`);
-    console.log('\n For iPhone: open https://<your-PC-IP>:3443 in Safari');
-    console.log(' Accept the self-signed cert warning once, then "Add to Home Screen"\n');
+// Skip the self-signed HTTPS listener when the host terminates TLS (e.g. Hugging Face Spaces)
+const HTTPS_DISABLED = process.env.DISABLE_HTTPS === '1' || !!process.env.SPACE_ID;
+
+if (HTTPS_DISABLED) {
+  console.log(' HTTPS listener disabled (TLS handled by host)');
+} else {
+  getOrCreateCert().then((tlsCreds) => {
+    https.createServer(tlsCreds, app).listen(HTTPS_PORT, '0.0.0.0', () => {
+      console.log(` HTTPS → https://localhost:${HTTPS_PORT}`);
+      console.log('\n For iPhone: open https://<your-PC-IP>:3443 in Safari');
+      console.log(' Accept the self-signed cert warning once, then "Add to Home Screen"\n');
+    });
   });
-});
+}
