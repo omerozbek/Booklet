@@ -69,29 +69,84 @@ class ComixToScraper extends BaseScraper {
   async _scrapeAllChapterPages(page) {
     const seen = new Map(); // chapter number → chapter object
 
-    // Walk every pager page. Termination is driven by the active-page indicator
-    // (.npager__num.is-active): when clicking Next no longer changes it, or the
-    // Next button is gone, we've reached the last page. This is more reliable
-    // than diffing row hrefs, which can repeat across pages of the same chapter.
-    let activePrev = null;
-    for (let guard = 0; guard < 500; guard++) {
-      const state = await page.evaluate(() => {
-        const rows = Array.from(document.querySelectorAll('.mchap-row')).map(row => {
-          const a = row.querySelector('a[href*="-chapter-"]');
-          if (!a) return null;
-          return {
-            url: a.href,
-            title: a.querySelector('.mchap-row__ch')?.textContent.trim() || a.textContent.trim(),
-          };
-        }).filter(Boolean);
+    // Read the current pager page: its rows, which page is active, and how the
+    // pager is currently laid out.
+    const readState = () => page.evaluate(() => {
+      const rows = Array.from(document.querySelectorAll('.mchap-row')).map(row => {
+        const a = row.querySelector('a[href*="-chapter-"]');
+        if (!a) return null;
         return {
-          rows,
-          active: document.querySelector('.npager__num.is-active')?.textContent?.trim() || null,
-          hasNext: !!document.querySelector('.npager__nav[aria-label="Next page"]:not([disabled])'),
+          url: a.href,
+          title: a.querySelector('.mchap-row__ch')?.textContent.trim() || a.textContent.trim(),
         };
-      });
+      }).filter(Boolean);
+      const active = parseInt(document.querySelector('.npager__num.is-active')?.textContent?.trim() || '', 10);
+      return {
+        rows,
+        active: Number.isFinite(active) ? active : null,
+        hasNext: !!document.querySelector('.npager__nav[aria-label="Next page"]:not([disabled])'),
+      };
+    });
 
-      for (const ch of state.rows) {
+    // While the chapter list re-renders, the pager briefly drops its nav
+    // buttons — read it mid-render and "Next page" looks like it's gone. That
+    // used to end the walk early and silently truncate the chapter list at a
+    // random page. So never act on a single reading: wait until two
+    // consecutive reads agree before deciding anything.
+    const settle = async () => {
+      let prev = null;
+      let state = null;
+      for (let i = 0; i < 40; i++) {
+        state = await readState();
+        // Mid-render the pager has no active number and the list can be empty;
+        // such a reading proves nothing, so it never counts towards agreement.
+        if (state.active !== null && state.rows.length) {
+          const sig = `${state.active}|${state.rows.length}|${state.rows[0].url}|${state.hasNext}`;
+          if (sig === prev) return state;
+          prev = sig;
+        } else {
+          prev = null;
+        }
+        await new Promise(r => setTimeout(r, 120));
+      }
+      return state;
+    };
+
+    const clickNav = (label) => page.evaluate((l) => {
+      const b = document.querySelector(`.npager__nav[aria-label="${l}"]`);
+      if (!b || b.disabled) return false;
+      b.click();
+      return true;
+    }, label);
+
+    /** Click the pager button for a specific page number, if it's on screen. */
+    const clickPageNumber = (n) => page.evaluate((num) => {
+      const btn = Array.from(document.querySelectorAll('.npager__num'))
+        .find(b => parseInt(b.textContent.trim(), 10) === num);
+      if (!btn || btn.disabled) return false;
+      btn.click();
+      return true;
+    }, n);
+
+    /** Wait until the pager's active number is something other than `prev`. */
+    const waitForPageChange = (prev) => page.waitForFunction(
+      (p) => {
+        const a = parseInt(document.querySelector('.npager__num.is-active')?.textContent?.trim() || '', 10);
+        return Number.isFinite(a) && a !== p;
+      },
+      { timeout: 8000 },
+      prev
+    ).then(() => true).catch(() => false);
+
+    /** Wait until the pager reports it is on exactly page `n`. */
+    const waitForPage = (n) => page.waitForFunction(
+      (want) => parseInt(document.querySelector('.npager__num.is-active')?.textContent?.trim() || '', 10) === want,
+      { timeout: 5000 },
+      n
+    ).then(() => true).catch(() => false);
+
+    const collect = (rows) => {
+      for (const ch of rows) {
         // Handle decimal chapters in either "-chapter-40-5" or "-chapter-40.5" form.
         const m = ch.url.match(/-chapter-(\d+(?:[.-]\d+)?)/i);
         const number = m ? parseFloat(m[1].replace('-', '.')) : null;
@@ -100,24 +155,68 @@ class ComixToScraper extends BaseScraper {
           seen.set(key, { url: ch.url, number, title: ch.title || (number != null ? `Chapter ${number}` : ch.title) });
         }
       }
+    };
 
-      // Stop if the page didn't advance since the last click, or there's no next.
-      if (activePrev !== null && state.active === activePrev) break;
-      activePrev = state.active;
-      if (!state.hasNext) break;
+    // Ask the pager how many pages there actually are, by jumping to the last
+    // one and reading the active number, then coming back. Knowing the target
+    // up front means the walk below stops because it reached the end, not
+    // because a button blinked out of the DOM at the wrong moment.
+    const startUrl = page.url();
+    let state = await settle();
+    let totalPages = null;
+    if (state.active !== null && await clickNav('Last page')) {
+      await waitForPageChange(state.active);
+      const last = await settle();
+      totalPages = last.active;
+      collect(last.rows); // already here — no reason to fetch it again
 
-      await page.evaluate(() => document.querySelector('.npager__nav[aria-label="Next page"]')?.click());
-      await page.waitForFunction(
-        (prev) => (document.querySelector('.npager__num.is-active')?.textContent?.trim() || null) !== prev,
-        { timeout: 8000 },
-        state.active
-      ).catch(() => {});
-      await new Promise(r => setTimeout(r, 150));
+      if (await clickNav('First page')) await waitForPageChange(last.active);
+      state = await settle();
+      if (state.active !== 1) {
+        // Couldn't get back to the start by clicking — reload and start over.
+        await page.goto(startUrl, { waitUntil: 'networkidle2', timeout: 35000 });
+        await page.waitForSelector('.mpage__chapters .mchap-row', { timeout: 15000 });
+        state = await settle();
+        if (state.active !== 1) totalPages = null; // give up on the count, walk blind
+      }
     }
 
-    return [...seen.values()]
+    const limit = totalPages ? totalPages + 5 : 500;
+    for (let guard = 0; guard < limit; guard++) {
+      collect(state.rows);
+
+      // With the page count known, that's the only stop condition worth
+      // trusting; without it, fall back to the (racy) Next button.
+      if (totalPages ? state.active >= totalPages : !state.hasNext) break;
+      if (state.active === null) break; // no readable pager — this is the only page
+
+      // Prefer clicking the target page's own number over "Next page": it
+      // says exactly where to land, so a click that lands nowhere (the pager
+      // re-rendered under it) is retried rather than mistaken for the end of
+      // the list. Falling short here is how pages used to get skipped.
+      const target = state.active + 1;
+      let advanced = false;
+      for (let attempt = 0; attempt < 4 && !advanced; attempt++) {
+        const clicked = (await clickPageNumber(target)) || (await clickNav('Next page'));
+        if (!clicked) {
+          await new Promise(r => setTimeout(r, 300));
+          continue;
+        }
+        advanced = await waitForPage(target);
+      }
+      if (!advanced) {
+        console.warn(`[title] pager stalled on page ${state.active}${totalPages ? ` of ${totalPages}` : ''}`);
+        break;
+      }
+      state = await settle();
+    }
+
+    const chapters = [...seen.values()]
       .filter(c => c.number !== null) // drop rows we couldn't assign a number to
       .sort((a, b) => a.number - b.number);
+    console.log(`[title] ${chapters.length} chapters over ${totalPages ?? '?'} pager pages` +
+      (chapters.length ? ` (${chapters[0].number}–${chapters[chapters.length - 1].number})` : ''));
+    return chapters;
   }
 
   // ─── Chapter images (DOM scraping) ──────────────────────────────────────
@@ -159,23 +258,38 @@ class ComixToScraper extends BaseScraper {
           document.querySelector('.rpage-main--long-strip') ||
           document.querySelector('.rpage-main') ||
           document.scrollingElement;
-        const pages = Array.from(document.querySelectorAll('.rpage-page'));
-        const total = pages.length;
-        const dp = (el) => el.getAttribute('data-page') || null;
 
-        const map = {};              // data-page → url
+        // Every .rpage-page carries a stable data-page index. Page order is
+        // taken from that number and nothing else — never from the order of a
+        // NodeList captured up front, which can be short (pages not mounted
+        // yet) or stale (nodes replaced) by the time the sweep finishes.
+        const map = new Map();        // data-page → url
         const canvasPages = new Set();
-        const scan = () => document.querySelectorAll('.rpage-page').forEach(pg => {
-          const key = pg.getAttribute('data-page');
-          if (!key || map[key]) return;
-          const img = pg.querySelector('img');
-          if (img && img.src && img.src.startsWith('http')) map[key] = img.src;
-          else if (pg.querySelector('canvas')) canvasPages.add(key);
-        });
-        // Pages still worth chasing: no URL yet and not a (protected) canvas.
-        const remaining = () => pages.map(dp).filter(k => k && !map[k] && !canvasPages.has(k));
+        const known = new Set();      // every data-page the reader ever showed
 
-        // Pass 1: fast sweep top to bottom to load the bulk of the pages.
+        const scan = () => {
+          for (const pg of document.querySelectorAll('.rpage-page')) {
+            const key = pg.getAttribute('data-page');
+            if (!key) continue;
+            known.add(key);
+            if (map.has(key)) continue;
+            const img = pg.querySelector('img');
+            if (img && img.src && img.src.startsWith('http')) {
+              map.set(key, img.src);
+              canvasPages.delete(key);
+            } else if (pg.querySelector('canvas')) {
+              canvasPages.add(key);
+            }
+          }
+        };
+        // Pages still worth chasing: no URL yet and not a (protected) canvas.
+        const remaining = () => [...known].filter(k => !map.has(k) && !canvasPages.has(k));
+
+        scan();
+
+        // Pass 1: fast sweep top to bottom to load the bulk of the pages. The
+        // strip grows as real images replace placeholders, so scrollHeight is
+        // re-read every step rather than fixed up front.
         const step = Math.max(500, Math.floor((scroller.clientHeight || 900) * 0.85));
         for (let y = 0; y <= scroller.scrollHeight; y += step) {
           scroller.scrollTop = y;
@@ -200,11 +314,32 @@ class ComixToScraper extends BaseScraper {
         }
         scan();
 
-        const ordered = pages.map((pg, i) => {
-          const key = dp(pg) || String(i + 1);
-          return { page: key, url: map[key] || null, isCanvas: canvasPages.has(key) };
-        });
-        return { total, ordered, gotUrls: Object.keys(map).length };
+        // Order strictly by page number. Any page in the range we never got a
+        // URL for still gets its slot, so a gap can never shift every later
+        // page up by one.
+        const num = k => { const n = parseInt(k, 10); return Number.isFinite(n) ? n : null; };
+        const byNum = new Map();
+        for (const k of known) {
+          const n = num(k);
+          if (n !== null && !byNum.has(n)) byNum.set(n, k);
+        }
+        const lo = byNum.size ? Math.min(...byNum.keys()) : 0;
+        const hi = byNum.size ? Math.max(...byNum.keys()) : 0;
+
+        let ordered;
+        if (byNum.size === known.size && byNum.size && hi - lo < 2000) {
+          ordered = [];
+          for (let n = lo; n <= hi; n++) {
+            const k = byNum.get(n);
+            ordered.push({ page: k ?? String(n), url: k ? (map.get(k) || null) : null });
+          }
+        } else {
+          // Non-numeric data-page values: fall back to sorting what we have.
+          ordered = [...known]
+            .sort((a, b) => (num(a) ?? 0) - (num(b) ?? 0))
+            .map(k => ({ page: k, url: map.get(k) || null }));
+        }
+        return { total: ordered.length, ordered, gotUrls: map.size };
       });
 
       // Let any in-flight image buffers finish caching before the page closes.
@@ -216,7 +351,12 @@ class ComixToScraper extends BaseScraper {
       // canvas-protected pages we can't retrieve.
       const images = harvest.ordered.map(p => p.url || protectedPagePlaceholder(p.page));
       const protectedCount = harvest.ordered.filter(p => !p.url).length;
-      console.log(`[chapter] ${images.length} pages (${harvest.gotUrls} images, ${protectedCount} protected/placeholder)`);
+      // Two slots pointing at one image means a page was harvested from a
+      // half-updated DOM — worth seeing in the log if it ever happens again.
+      const realUrls = harvest.ordered.filter(p => p.url).map(p => p.url);
+      const dupes = realUrls.length - new Set(realUrls).size;
+      console.log(`[chapter] ${images.length} pages (${harvest.gotUrls} images, ${protectedCount} protected/placeholder` +
+        (dupes ? `, ${dupes} DUPLICATE url(s)` : '') + ')');
 
       const cookies = await page.cookies();
       const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');

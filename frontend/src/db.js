@@ -63,15 +63,165 @@ export async function saveChapterMeta(chapter) {
   await db.put('chapters', chapter);
 }
 
+/** Merge a patch into a stored chapter without clobbering fields set elsewhere. */
+export async function updateChapterMeta(chapterUrl, patch) {
+  const db = await getDb();
+  const existing = await db.get('chapters', chapterUrl);
+  if (!existing) return null;
+  const next = { ...existing, ...patch };
+  await db.put('chapters', next);
+  return next;
+}
+
+// ─── Chapter identity ──────────────────────
+//
+// Sites list several uploads of the same chapter — one per scanlation group —
+// each under its own URL (on comix.to, .../11306138-chapter-61 and
+// .../11306111-chapter-61 are both chapter 61). Records are keyed by URL, so
+// when the site surfaces a different upload than the one already saved, the
+// same chapter gets stored twice: the list doubles, and the copy carrying
+// `downloaded: true` hides behind the fresh duplicate — downloads look lost.
+//
+// A chapter's real identity is (titleUrl, number). The URL is only the upload
+// we happen to read. Everything below keys off that.
+
+function chapterKey(ch) {
+  return ch.number == null || Number.isNaN(ch.number) ? `url:${ch.url}` : `num:${ch.number}`;
+}
+
+function sortChapters(list) {
+  return list.slice().sort((a, b) => {
+    if (a.number == null && b.number == null) return 0;
+    if (a.number == null) return 1; // unnumbered specials go last, not first
+    if (b.number == null) return -1;
+    return a.number - b.number;
+  });
+}
+
+/** Of several stored rows for one chapter, the copy worth keeping. */
+function bestOf(rows) {
+  return rows.slice().sort((a, b) =>
+    (b.imageCount || 0) - (a.imageCount || 0) ||
+    (b.downloaded ? 1 : 0) - (a.downloaded ? 1 : 0) ||
+    (b.lastReadAt || 0) - (a.lastReadAt || 0)
+  )[0];
+}
+
+/** Fold duplicate rows for one chapter into a single record, keeping the
+ *  furthest reading progress and any hand-edited name found on any of them. */
+function mergeGroup(rows) {
+  if (rows.length === 1) return rows[0];
+  const winner = bestOf(rows);
+  const lastReadAt = Math.max(...rows.map((r) => r.lastReadAt || 0)) || undefined;
+  const readStatus = rows.some((r) => r.readStatus === 'completed')
+    ? 'completed'
+    : rows.some((r) => r.readStatus === 'reading')
+      ? 'reading'
+      : winner.readStatus;
+  const edited = rows.find((r) => r.titleEdited);
+  return {
+    ...winner,
+    lastReadAt,
+    readStatus,
+    ...(edited ? { title: edited.title, titleEdited: true } : {}),
+  };
+}
+
+function groupByChapter(rows) {
+  const groups = new Map();
+  for (const ch of rows) {
+    const k = chapterKey(ch);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(ch);
+  }
+  return groups;
+}
+
 export async function getChaptersForTitle(titleUrl) {
   const db = await getDb();
   const chapters = await db.getAllFromIndex('chapters', 'titleUrl', titleUrl);
-  return chapters.sort((a, b) => (a.number ?? 0) - (b.number ?? 0));
+  // Collapse duplicates for display too, so a doubled list reads correctly
+  // even offline, before any sync has had a chance to clean the store up.
+  return sortChapters([...groupByChapter(chapters).values()].map(mergeGroup));
 }
 
 export async function getChapterMeta(chapterUrl) {
   const db = await getDb();
   return db.get('chapters', chapterUrl);
+}
+
+/** Delete a chapter row outright, with its images and saved scroll position. */
+async function purgeChapter(db, chapterUrl) {
+  const imgs = await db.getAllFromIndex('images', 'chapterUrl', chapterUrl);
+  const tx = db.transaction(['images', 'chapters'], 'readwrite');
+  for (const img of imgs) tx.objectStore('images').delete(img.id);
+  tx.objectStore('chapters').delete(chapterUrl);
+  await tx.done;
+  try { localStorage.removeItem(`scroll:${chapterUrl}`); } catch { /* ignore */ }
+}
+
+/**
+ * Reconcile a freshly scraped chapter list into the store, matching on chapter
+ * number rather than URL, and return the merged list to display.
+ *
+ * Rules, in order of how much they matter:
+ *  - Duplicate rows for one chapter are collapsed into the best copy.
+ *  - A chapter the user has invested in (downloaded pages or reading progress)
+ *    stays pinned to the exact upload those belong to, whatever the site is
+ *    surfacing today. That is what stops downloads from going missing.
+ *  - An untouched chapter follows the site, so one whose upload was pulled
+ *    heals itself on the next open.
+ *  - Stored chapters the scrape did not return are kept, never deleted. A
+ *    partial scrape (site hiccup, offline) must not shrink the library.
+ */
+export async function syncTitleChapters(titleUrl, scraped) {
+  const db = await getDb();
+  const stored = await db.getAllFromIndex('chapters', 'titleUrl', titleUrl);
+
+  const merged = new Map();
+  const drop = new Set();
+
+  for (const [key, rows] of groupByChapter(stored)) {
+    const row = mergeGroup(rows);
+    merged.set(key, row);
+    for (const r of rows) if (r.url !== row.url) drop.add(r.url);
+  }
+
+  for (const ch of scraped || []) {
+    const key = chapterKey(ch);
+    const prev = merged.get(key);
+    if (!prev) {
+      merged.set(key, { ...ch, titleUrl, downloaded: false, imageCount: 0 });
+      continue;
+    }
+    const anchored =
+      prev.downloaded || (prev.imageCount || 0) > 0 || !!prev.lastReadAt || !!prev.readStatus;
+    if (!anchored && prev.url !== ch.url) drop.add(prev.url);
+    merged.set(key, {
+      ...prev,
+      ...ch,
+      url: anchored ? prev.url : ch.url,
+      titleUrl,
+      title: prev.titleEdited ? prev.title : ch.title || prev.title,
+      titleEdited: prev.titleEdited || false,
+      downloaded: prev.downloaded || false,
+      imageCount: prev.imageCount || 0,
+      readStatus: prev.readStatus,
+      lastReadAt: prev.lastReadAt,
+    });
+  }
+
+  const final = sortChapters([...merged.values()]);
+  const keepUrls = new Set(final.map((c) => c.url));
+  for (const url of drop) {
+    if (!keepUrls.has(url)) await purgeChapter(db, url);
+  }
+
+  const tx = db.transaction('chapters', 'readwrite');
+  for (const ch of final) tx.objectStore('chapters').put(ch);
+  await tx.done;
+
+  return final;
 }
 
 // ─── Images ────────────────────────────────
@@ -91,6 +241,18 @@ export async function saveChapterReadStatus(chapterUrl, status) {
   const db = await getDb();
   const ch = await db.get('chapters', chapterUrl);
   if (ch) await db.put('chapters', { ...ch, readStatus: status, lastReadAt: Date.now() });
+}
+
+/** Drop a chapter's stored pages without touching its metadata. Used before a
+ *  (re)download so a shorter new page list can't leave stale trailing pages
+ *  from the previous attempt behind. */
+export async function clearChapterImages(chapterUrl) {
+  const db = await getDb();
+  const imgs = await db.getAllFromIndex('images', 'chapterUrl', chapterUrl);
+  if (!imgs.length) return;
+  const tx = db.transaction('images', 'readwrite');
+  for (const img of imgs) tx.objectStore('images').delete(img.id);
+  await tx.done;
 }
 
 export async function deleteChapterImages(chapterUrl) {

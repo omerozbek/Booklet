@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import {
   getChapterImages,
+  getChapterMeta,
   saveChapterReadStatus,
   getChaptersForTitle,
   deleteChapterImages,
@@ -227,8 +228,13 @@ export default function Reader() {
     saveChapterReadStatus(chapter.url, 'reading');
 
     try {
+      // Only read from storage when the saved copy is complete. A download cut
+      // short (cancelled, dropped connection) leaves a run of pages that would
+      // otherwise be shown as if it were the whole chapter.
+      const meta = await getChapterMeta(chapter.url);
       const blobs = await getChapterImages(chapter.url);
-      if (blobs.length > 0) {
+      const expected = meta?.imageCount || 0;
+      if (blobs.length > 0 && meta?.downloaded && blobs.length === expected) {
         setImages(blobs.map((blob) => ({ src: URL.createObjectURL(blob), isBlob: true })));
         setLoading(false);
         return;
@@ -323,8 +329,10 @@ export default function Reader() {
         </div>
       ) : (
         <div className="reader-images" ref={imagesContainerRef}>
+          {/* Keyed by position, not by src: a chapter can legitimately repeat
+              an image URL, and duplicate keys make React reuse the wrong node. */}
           {images.map((img, i) => (
-            <LazyImage key={img.src} src={img.src} index={i} />
+            <LazyImage key={`${i}:${img.src}`} src={img.src} index={i} />
           ))}
 
           {hasNext ? (

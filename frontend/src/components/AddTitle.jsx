@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { saveTitleMeta, saveChapterMeta } from '../db';
+import { saveTitleMeta, syncTitleChapters } from '../db';
 
 export default function AddTitle({ onClose, onAdded }) {
   const [url, setUrl] = useState('');
@@ -30,10 +30,11 @@ export default function AddTitle({ onClose, onAdded }) {
       const chapters = data.chapters || [];
       setStatus(`Saving chapters…`);
       setProgress({ current: 0, total: chapters.length });
-      for (let i = 0; i < chapters.length; i++) {
-        await saveChapterMeta({ ...chapters[i], titleUrl: trimmed, downloaded: false, imageCount: 0 });
-        setProgress({ current: i + 1, total: chapters.length });
-      }
+      // Adding a title that's already in the library used to rewrite every
+      // chapter with downloaded:false, orphaning the saved pages. Go through
+      // the same reconcile the title screen uses so existing state survives.
+      await syncTitleChapters(trimmed, chapters);
+      setProgress({ current: chapters.length, total: chapters.length });
 
       onAdded(titleMeta);
       onClose();

@@ -5,6 +5,7 @@ import {
   saveTitleMeta,
   getChaptersForTitle,
   saveChapterMeta,
+  syncTitleChapters,
   deleteChapterImages,
 } from '../db';
 import { useDownloads } from '../context/DownloadContext';
@@ -64,22 +65,9 @@ export default function TitleView() {
       await saveTitleMeta(titleMeta);
       setMeta(titleMeta);
 
-      const existing = Object.fromEntries(cachedChapters.map((c) => [c.url, c]));
-      const merged = (data.chapters || []).map((ch) => ({
-        ...ch,
-        titleUrl,
-        title: existing[ch.url]?.titleEdited ? existing[ch.url].title : ch.title,
-        titleEdited: existing[ch.url]?.titleEdited || false,
-        downloaded: existing[ch.url]?.downloaded || false,
-        imageCount: existing[ch.url]?.imageCount || 0,
-        readStatus: existing[ch.url]?.readStatus,
-        lastReadAt: existing[ch.url]?.lastReadAt,
-      }));
-
-      for (const ch of merged) {
-        if (!existing[ch.url]) await saveChapterMeta(ch);
-      }
-      setChapters(merged);
+      // Matching on chapter number (not URL), collapsing duplicates, and
+      // keeping chapters the scrape missed all live in syncTitleChapters.
+      setChapters(await syncTitleChapters(titleUrl, data.chapters || []));
     } catch (err) {
       if (!meta) setError(err.message);
     }
