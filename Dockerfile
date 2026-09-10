@@ -4,6 +4,8 @@ WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
+# Render passes env vars as build args; used to show the commit in Settings
+ARG RENDER_GIT_COMMIT
 RUN npm run build
 
 # ---------- Stage 2: runtime ----------

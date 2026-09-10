@@ -230,6 +230,22 @@ export default function Settings() {
             </div>
           )}
         </section>
+
+        <section className="settings-section">
+          <h2 className="settings-section-title">About</h2>
+
+          <div className="settings-row">
+            <div className="settings-row-text">
+              <div className="settings-row-label">Version</div>
+              <div className="settings-row-desc">
+                Built {new Date(__BUILD_TIME__).toLocaleString()}
+              </div>
+            </div>
+            <span className="settings-storage-size">
+              v{__APP_VERSION__}{__GIT_COMMIT__ && ` (${__GIT_COMMIT__})`}
+            </span>
+          </div>
+        </section>
       </div>
     </div>
   );
