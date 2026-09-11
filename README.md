@@ -108,6 +108,19 @@ const scrapers = {
 };
 ```
 
+## Commit Workflow
+
+- **Commit after every change.** Each change gets its own commit — don't let work pile up uncommitted.
+- **No AI attribution.** Commit messages must not mention Claude or any AI assistant — no `Co-Authored-By` trailers, session links, or "generated with" notes.
+- **Bump the version in every commit.** The app version shown in **Settings → About** comes from `frontend/package.json`. Bump it before committing (patch for fixes, minor for features):
+
+  ```bash
+  cd frontend
+  npm version patch --no-git-tag-version   # or: minor
+  ```
+
+  This updates both `package.json` and `package-lock.json`; include them in the commit.
+
 ## Project Structure
 
 ```
