@@ -1,11 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getAllTitles, deleteTitle } from '../db';
+import { getAllTitles, deleteTitle, subscribeStorageMigration } from '../db';
 import AddTitle from '../components/AddTitle';
 import logoUrl from '/icon.svg';
 
 export default function Library() {
-  const [titles, setTitles] = useState([]);
+  const [titles, setTitles] = useState(null); // null until the library has loaded
+  const [loadError, setLoadError] = useState('');
+  const [migration, setMigration] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
   const [lastRead, setLastRead] = useState(null);
   const [pendingDelete, setPendingDelete] = useState(null); // title awaiting confirmation
@@ -13,8 +15,15 @@ export default function Library() {
   const navigate = useNavigate();
 
   const loadTitles = useCallback(async () => {
-    setTitles(await getAllTitles());
+    setLoadError('');
+    try {
+      setTitles(await getAllTitles());
+    } catch (err) {
+      setLoadError(err.message || String(err));
+    }
   }, []);
+
+  useEffect(() => subscribeStorageMigration(setMigration), []);
 
   useEffect(() => {
     loadTitles();
@@ -39,7 +48,7 @@ export default function Library() {
     setDeleting(true);
     try {
       await deleteTitle(url);
-      setTitles((prev) => prev.filter((t) => t.url !== url));
+      setTitles((prev) => (prev || []).filter((t) => t.url !== url));
       if (lastRead?.titleUrl === url) setLastRead(null);
       setPendingDelete(null);
     } catch (err) {
@@ -49,7 +58,7 @@ export default function Library() {
     }
   }
 
-  const lastReadTitle = lastRead ? titles.find((t) => t.url === lastRead.titleUrl) : null;
+  const lastReadTitle = lastRead && titles ? titles.find((t) => t.url === lastRead.titleUrl) : null;
 
   return (
     <div className="page">
@@ -86,7 +95,30 @@ export default function Library() {
           </div>
         )}
 
-        {titles.length === 0 ? (
+        {migration?.state === 'running' && migration.total > 0 && (
+          <div className="stale-banner">
+            Moving your downloads to faster storage… {migration.moved}/{migration.total}.
+            Keep the app open until it finishes — reading still works meanwhile.
+          </div>
+        )}
+        {migration?.state === 'stalled' && (
+          <div className="stale-banner" onClick={() => navigate('/settings')}>
+            Couldn't finish moving your downloads. <strong>Open Settings</strong> for details.
+          </div>
+        )}
+
+        {loadError ? (
+          <div className="error-banner">
+            Couldn't open your library: {loadError}
+            <div style={{ marginTop: 10 }}>
+              <button className="btn btn-secondary btn-sm" onClick={loadTitles}>Try again</button>
+            </div>
+          </div>
+        ) : titles === null ? (
+          <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}>
+            <div className="spinner" />
+          </div>
+        ) : titles.length === 0 ? (
           <div className="empty-state">
             <div className="icon">📚</div>
             <p>No titles yet.<br />Tap <strong>+ Add</strong> and paste a manhwa URL to get started.</p>
@@ -156,8 +188,8 @@ export default function Library() {
           onClose={() => setShowAdd(false)}
           onAdded={(title) => {
             setTitles((prev) => {
-              const exists = prev.some((t) => t.url === title.url);
-              return exists ? prev : [...prev, title];
+              const list = prev || [];
+              return list.some((t) => t.url === title.url) ? list : [...list, title];
             });
           }}
         />

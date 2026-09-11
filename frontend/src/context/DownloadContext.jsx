@@ -3,9 +3,11 @@ import {
   saveImage,
   saveChapterMeta,
   updateChapterMeta,
-  clearChapterImages,
+  resetChapterPages,
+  closeChapterPages,
   needsRedownload,
   DOWNLOAD_FORMAT,
+  OWN_PAGE_DB,
 } from '../db';
 
 const DownloadContext = createContext(null);
@@ -29,6 +31,7 @@ export function DownloadProvider({ children }) {
     const abort = new AbortController();
     abortRefs.current[chapter.url] = abort;
     let result = { ok: true };
+    let pagesReset = false; // past this point a failure must not leave half a chapter
 
     try {
       setDownloads((prev) => ({ ...prev, [chapter.url]: { current: 0, total: 0 } }));
@@ -43,11 +46,12 @@ export function DownloadProvider({ children }) {
       // Start from a clean slate: a previous attempt may have left pages
       // behind, and if it had more pages than this one those extras would
       // survive at the end of the chapter.
-      await clearChapterImages(chapter.url);
-      await updateChapterMeta(chapter.url, { downloaded: false, imageCount: 0, savedWith: undefined });
+      await resetChapterPages(chapter.url);
+      pagesReset = true;
 
       setDownloads((prev) => ({ ...prev, [chapter.url]: { current: 0, total: images.length } }));
 
+      let bytes = 0;
       for (let i = 0; i < images.length; i++) {
         if (abort.signal.aborted) break;
         const proxyUrl = `/api/proxy?url=${encodeURIComponent(images[i])}&referer=${encodeURIComponent(chapter.url)}`;
@@ -55,14 +59,16 @@ export function DownloadProvider({ children }) {
         if (!imgRes.ok) throw new Error(`Image fetch failed: ${imgRes.status}`);
         const blob = await imgRes.blob();
         await saveImage(chapter.url, i, blob);
+        bytes += blob.size;
         setDownloads((prev) => ({ ...prev, [chapter.url]: { current: i + 1, total: images.length } }));
       }
 
       if (abort.signal.aborted) {
         // A half-saved chapter reads as a corrupt one, so leave nothing behind.
-        await clearChapterImages(chapter.url);
+        await resetChapterPages(chapter.url);
       } else {
-        const done = { downloaded: true, imageCount: images.length, savedWith: DOWNLOAD_FORMAT };
+        await closeChapterPages(chapter.url);
+        const done = { downloaded: true, imageCount: images.length, bytes, savedWith: DOWNLOAD_FORMAT, storage: OWN_PAGE_DB };
         const stored = await updateChapterMeta(chapter.url, done);
         const updated = stored || { ...chapter, ...done };
         if (!stored) await saveChapterMeta(updated);
@@ -70,11 +76,9 @@ export function DownloadProvider({ children }) {
       }
     } catch (err) {
       result = { ok: false, error: err.message };
-      if (err.name !== 'AbortError') {
-        await clearChapterImages(chapter.url).catch(() => {});
-        await updateChapterMeta(chapter.url, { downloaded: false, imageCount: 0 }).catch(() => {});
-        if (!options.silent) alert(`Download failed: ${err.message}`);
-      }
+      // Before the reset, an existing saved copy is still intact — keep it.
+      if (pagesReset) await resetChapterPages(chapter.url).catch(() => {});
+      if (err.name !== 'AbortError' && !options.silent) alert(`Download failed: ${err.message}`);
     } finally {
       setDownloads((prev) => {
         const next = { ...prev };

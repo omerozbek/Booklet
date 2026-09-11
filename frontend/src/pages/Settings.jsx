@@ -1,6 +1,13 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getStorageByTitle, exportData, importData } from '../db';
+import {
+  getStorageByTitle,
+  exportData,
+  importData,
+  subscribeStorageMigration,
+  migrateLegacyPages,
+  discardLegacyPages,
+} from '../db';
 
 function formatBytes(bytes) {
   if (bytes === 0) return '0 B';
@@ -24,6 +31,8 @@ export default function Settings() {
   const [autoDelete, setAutoDelete] = useState(loadAutoDelete);
   const [busy, setBusy] = useState(null); // 'export' | 'import' | null
   const [migrateMsg, setMigrateMsg] = useState('');
+  const [pageMove, setPageMove] = useState(null);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
   const fileInputRef = useRef(null);
 
   const enabled = autoDelete.enabled || false;
@@ -39,6 +48,24 @@ export default function Settings() {
   useEffect(() => {
     refreshStorage();
   }, []);
+
+  useEffect(() => subscribeStorageMigration(setPageMove), []);
+
+  async function retryPageMove() {
+    setConfirmDiscard(false);
+    await migrateLegacyPages();
+    await refreshStorage();
+  }
+
+  async function handleDiscard() {
+    if (!confirmDiscard) return setConfirmDiscard(true);
+    setConfirmDiscard(false);
+    try {
+      await discardLegacyPages();
+    } finally {
+      await refreshStorage();
+    }
+  }
 
   async function handleExport() {
     setBusy('export');
@@ -159,6 +186,29 @@ export default function Settings() {
 
         <section className="settings-section">
           <h2 className="settings-section-title">Storage</h2>
+
+          {pageMove?.state === 'running' && pageMove.total > 0 && (
+            <div className="stale-banner">
+              Moving downloads to faster storage… {pageMove.moved}/{pageMove.total}
+            </div>
+          )}
+          {pageMove?.state === 'stalled' && (
+            <div className="stale-banner">
+              {pageMove.error}
+              <div style={{ margin: '8px 0' }}>
+                <strong>Remove old storage</strong> frees the space it holds; chapters that
+                weren't moved yet will need downloading again.
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button className="btn btn-secondary btn-sm" onClick={retryPageMove}>
+                  Try again
+                </button>
+                <button className="btn btn-accent btn-sm" onClick={handleDiscard}>
+                  {confirmDiscard ? 'Tap again to confirm' : 'Remove old storage'}
+                </button>
+              </div>
+            </div>
+          )}
 
           {loadingStorage ? (
             <div style={{ display: 'flex', justifyContent: 'center', padding: 20 }}>
