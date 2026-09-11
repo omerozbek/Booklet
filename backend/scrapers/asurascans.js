@@ -6,6 +6,24 @@ const BaseScraper = require('./base');
 // hotlink protection (no Referer/cookies required).
 const BASE = 'https://asurascans.com';
 
+// Astro serialises island props as [type, value] pairs: 0 is a plain value
+// (an object's fields are pairs again), 1 is an array of pairs. Other types
+// (dates, maps, …) aren't needed here and are passed through as-is.
+function reviveAstroProps(node) {
+  if (Array.isArray(node)) {
+    const [type, value] = node;
+    if (type === 1 && Array.isArray(value)) return value.map(reviveAstroProps);
+    if (type === 0) return reviveAstroFields(value);
+    return value;
+  }
+  return reviveAstroFields(node);
+}
+
+function reviveAstroFields(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, reviveAstroProps(v)]));
+}
+
 class AsuraScansScraper extends BaseScraper {
   constructor() { super(BASE); }
 
@@ -50,29 +68,48 @@ class AsuraScansScraper extends BaseScraper {
   async fetchChapter(url) {
     const { $ } = await this.fetchHtml(url);
 
-    const images = [];
-    const seen = new Set();
-    $('img[src]').each((_, el) => {
-      const src = $(el).attr('src');
-      // Page images are served from the CDN under /asura-images/chapters/;
-      // this excludes the series cover thumbnail and site assets.
-      if (!src || !src.includes('/asura-images/chapters/')) return;
-      if (seen.has(src)) return;
-      seen.add(src);
-      images.push(src);
-    });
+    // The page order is the site's own, never re-derived from filenames. Asura
+    // splits tall pages into parts — 001.webp, 002_p1.webp, 002_p2.webp, …,
+    // 009.webp — and the old filename sort couldn't read "002_p1" as a page
+    // number, ranked those as page 0 and shoved 001 to the end of the chapter.
+    const props = this._readerProps($);
+    if (props?.isLocked) {
+      throw new Error('This chapter is locked on Asura Scans (early access)');
+    }
 
+    // 1) The reader component's own page list.
+    let images = (props?.pages || [])
+      .map((p) => p?.url)
+      .filter((u) => typeof u === 'string' && u.startsWith('http'));
+
+    // 2) Fallback: the rendered <img> tags, in document order. Page images are
+    // served from the CDN under /asura-images/chapters/; this excludes the
+    // series cover thumbnail and site assets.
+    if (!images.length) {
+      $('img[src]').each((_, el) => {
+        const src = $(el).attr('src');
+        if (src && src.includes('/asura-images/chapters/')) images.push(src);
+      });
+    }
+
+    images = [...new Set(images)];
     if (!images.length) throw new Error('No chapter images found');
 
-    // Order by the page number in the filename (e.g. .../1/001.webp) so the
-    // reader never depends on DOM order.
-    const pageNum = (u) => {
-      const m = u.match(/\/(\d+)\.(?:webp|jpe?g|png)(?:\?|$)/i);
-      return m ? parseInt(m[1], 10) : 0;
-    };
-    images.sort((a, b) => pageNum(a) - pageNum(b));
-
     return { images };
+  }
+
+  /** Props of the Astro <astro-island> that renders the chapter reader. */
+  _readerProps($) {
+    let props = null;
+    $('astro-island[props]').each((_, el) => {
+      if (props) return;
+      const raw = $(el).attr('props');
+      if (!raw || !raw.includes('"pages"')) return;
+      try {
+        props = reviveAstroProps(JSON.parse(raw));
+      } catch { /* malformed — fall back to the DOM */ }
+    });
+    return props;
   }
 
   async search(query) {

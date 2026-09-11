@@ -286,12 +286,29 @@ class GenericScraper extends BaseScraper {
       await this._autoScroll(page);
       await page.waitForNetworkIdle({ idleTime: 1200, timeout: 15000 }).catch(() => {});
 
-      const images = await page.evaluate(() =>
-        Array.from(document.querySelectorAll('img'))
+      const images = await page.evaluate((containers, junkSource) => {
+        const junk = new RegExp(junkSource, 'i');
+        // Lazy loaders keep the real URL in a data- attribute until the image
+        // is decoded, with a spinner or data: placeholder in src meanwhile.
+        const pick = (img) => [
+          img.getAttribute('data-src'), img.getAttribute('data-lazy-src'),
+          img.getAttribute('data-original'), img.currentSrc, img.src,
+        ].find(s => s && /^https?:/.test(s) && !junk.test(s)) || null;
+
+        // Inside a reader container every image is a page, loaded or not, in
+        // document order. Filtering those by decoded size used to drop any
+        // page still loading and silently punch holes in the chapter.
+        for (const sel of containers) {
+          const c = document.querySelector(sel);
+          if (!c) continue;
+          const list = Array.from(c.querySelectorAll('img')).map(pick).filter(Boolean);
+          if (list.length >= 2) return list;
+        }
+        return Array.from(document.querySelectorAll('img'))
           .filter(img => (img.naturalWidth || 0) >= 300 && (img.naturalHeight || 0) >= 300)
-          .map(img => img.currentSrc || img.src)
-          .filter(s => s && s.startsWith('http'))
-      );
+          .map(pick)
+          .filter(Boolean);
+      }, READER_CONTAINERS, JUNK_IMG.source);
 
       await Promise.allSettled(bufferPromises);
 

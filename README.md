@@ -2,6 +2,10 @@
 
 A self-hosted Progressive Web App for downloading and reading manhwa on your iPhone. Runs a local Node.js backend that scrapes chapter images and proxies them to the app, which stores downloaded chapters in IndexedDB for offline reading.
 
+**Live app:** https://booklet-jmqp.onrender.com
+
+Open it in iPhone Safari and tap **Share → Add to Home Screen**. It's hosted on Render's free tier, so the first load after ~15 minutes of inactivity can take about a minute while the server wakes up.
+
 ## Features
 
 - Add any title by pasting its URL

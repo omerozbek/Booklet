@@ -7,6 +7,7 @@ import {
   saveChapterMeta,
   syncTitleChapters,
   deleteChapterImages,
+  needsRedownload,
 } from '../db';
 import { useDownloads } from '../context/DownloadContext';
 
@@ -74,7 +75,13 @@ export default function TitleView() {
   }
 
   function onChapterDownloaded(updated) {
-    setChapters((prev) => prev.map((c) => (c.url === updated.url ? { ...c, downloaded: true, imageCount: updated.imageCount } : c)));
+    setChapters((prev) =>
+      prev.map((c) =>
+        c.url === updated.url
+          ? { ...c, downloaded: true, imageCount: updated.imageCount, savedWith: updated.savedWith }
+          : c
+      )
+    );
   }
 
   function handleDownloadChapter(chapter) {
@@ -88,7 +95,7 @@ export default function TitleView() {
   async function deleteChapter(chapter) {
     await deleteChapterImages(chapter.url);
     setChapters((prev) =>
-      prev.map((c) => (c.url === chapter.url ? { ...c, downloaded: false, imageCount: 0 } : c))
+      prev.map((c) => (c.url === chapter.url ? { ...c, downloaded: false, imageCount: 0, savedWith: undefined } : c))
     );
   }
 
@@ -134,6 +141,7 @@ export default function TitleView() {
 
   const isDownloadingAll = downloadingAll[titleUrl] || false;
   const downloadedCount = chapters.filter((c) => c.downloaded).length;
+  const staleCount = chapters.filter(needsRedownload).length;
 
   const lastReadChapter = chapters.reduce((best, ch, idx) => {
     if (!ch.lastReadAt) return best;
@@ -207,6 +215,13 @@ export default function TitleView() {
       </div>
 
       <div className="scroll-area">
+        {staleCount > 0 && !isDownloadingAll && (
+          <div className="stale-banner">
+            {staleCount} saved chapter{staleCount === 1 ? ' was' : 's were'} downloaded with a
+            page-order bug and may be scrambled. <strong>Download All</strong> re-saves them,
+            or tap <strong>↻ Re-save</strong> on a chapter.
+          </div>
+        )}
         <div className="chapter-list">
           {chapters.map((ch, idx) => {
             const dl = downloads[ch.url];
@@ -233,16 +248,34 @@ export default function TitleView() {
                   <span className="chapter-row-badge badge-reading" title="In progress">●</span>
                 )}
 
-                {ch.downloaded ? (
-                  <>
-                    <span className="chapter-row-badge badge-downloaded">Saved</span>
-                    <button className="btn btn-primary btn-sm" onClick={() => openReader(ch, idx)}>Read</button>
-                    <button className="btn btn-ghost btn-sm" onClick={() => deleteChapter(ch)} title="Delete">✕</button>
-                  </>
-                ) : dl ? (
+                {dl ? (
                   <>
                     <span className="chapter-row-badge badge-downloading">{dl.current}/{dl.total}</span>
                     <button className="btn btn-secondary btn-sm" onClick={() => cancelDownload(ch.url)}>Cancel</button>
+                  </>
+                ) : ch.downloaded ? (
+                  <>
+                    {needsRedownload(ch) ? (
+                      // Saved before a scraper fix — pages are likely out of order.
+                      <button
+                        className="btn btn-accent btn-sm"
+                        onClick={() => handleDownloadChapter(ch)}
+                        title="Saved with a page-order bug — download again"
+                      >
+                        ↻ Re-save
+                      </button>
+                    ) : (
+                      <span className="chapter-row-badge badge-downloaded">Saved</span>
+                    )}
+                    <button className="btn btn-primary btn-sm" onClick={() => openReader(ch, idx)}>Read</button>
+                    <button
+                      className="btn btn-ghost btn-sm chapter-row-delete"
+                      onClick={() => deleteChapter(ch)}
+                      title="Delete"
+                      aria-label={`Delete saved ${ch.title}`}
+                    >
+                      ✕
+                    </button>
                   </>
                 ) : (
                   <button className="btn btn-secondary btn-sm" onClick={() => handleDownloadChapter(ch)}>↓ Save</button>

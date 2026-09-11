@@ -46,14 +46,23 @@ export async function getTitle(url) {
 export async function deleteTitle(url) {
   const db = await getDb();
   const chapters = await db.getAllFromIndex('chapters', 'titleUrl', url);
-  const tx = db.transaction(['chapters', 'images'], 'readwrite');
+  // Collect every key up front (keys only — no image blobs pulled into
+  // memory), then delete in one transaction with nothing awaited inside it.
+  const imageKeys = [];
   for (const ch of chapters) {
-    const imgs = await tx.objectStore('images').index('chapterUrl').getAll(ch.url);
-    for (const img of imgs) tx.objectStore('images').delete(img.id);
-    tx.objectStore('chapters').delete(ch.url);
+    imageKeys.push(...(await db.getAllKeysFromIndex('images', 'chapterUrl', ch.url)));
   }
+  const tx = db.transaction(['titles', 'chapters', 'images'], 'readwrite');
+  for (const key of imageKeys) tx.objectStore('images').delete(key);
+  for (const ch of chapters) tx.objectStore('chapters').delete(ch.url);
+  tx.objectStore('titles').delete(url);
   await tx.done;
-  await db.delete('titles', url);
+
+  try {
+    for (const ch of chapters) localStorage.removeItem(`scroll:${ch.url}`);
+    const lastRead = JSON.parse(localStorage.getItem('last-read') || 'null');
+    if (lastRead?.titleUrl === url) localStorage.removeItem('last-read');
+  } catch { /* ignore */ }
 }
 
 // ─── Chapters ──────────────────────────────
@@ -257,12 +266,45 @@ export async function clearChapterImages(chapterUrl) {
 
 export async function deleteChapterImages(chapterUrl) {
   const db = await getDb();
-  const imgs = await db.getAllFromIndex('images', 'chapterUrl', chapterUrl);
+  const ch = await db.get('chapters', chapterUrl);
+
+  // Clear every stored copy of this chapter, not just the row that was tapped.
+  // A library hit by the old duplicate-chapter bug can hold a second saved
+  // upload of the same chapter number, which would otherwise take over the
+  // row and bring "Saved" straight back after a delete.
+  let rows = ch ? [ch] : [];
+  if (ch && ch.number != null) {
+    rows = (await db.getAllFromIndex('chapters', 'titleUrl', ch.titleUrl))
+      .filter((r) => r.number === ch.number);
+  }
+  const urls = rows.length ? rows.map((r) => r.url) : [chapterUrl];
+
+  const imageKeys = [];
+  for (const url of urls) {
+    imageKeys.push(...(await db.getAllKeysFromIndex('images', 'chapterUrl', url)));
+  }
   const tx = db.transaction(['images', 'chapters'], 'readwrite');
-  for (const img of imgs) tx.objectStore('images').delete(img.id);
-  const ch = await tx.objectStore('chapters').get(chapterUrl);
-  if (ch) tx.objectStore('chapters').put({ ...ch, downloaded: false, imageCount: 0 });
+  for (const key of imageKeys) tx.objectStore('images').delete(key);
+  for (const r of rows) {
+    tx.objectStore('chapters').put({ ...r, downloaded: false, imageCount: 0, savedWith: undefined });
+  }
   await tx.done;
+}
+
+// Bumped whenever a scraper bug is found that saved pages wrongly. Downloads
+// stamped with an older value (or none) from an affected site get flagged in
+// the chapter list for a re-download.
+export const DOWNLOAD_FORMAT = 2;
+
+/** Downloads saved before Asura Scans' page-order fix are likely scrambled:
+ *  its split pages (002_p1, 002_p2, …) were sorted behind page 001. */
+export function needsRedownload(ch) {
+  if (!ch?.downloaded || (ch.savedWith || 0) >= DOWNLOAD_FORMAT) return false;
+  try {
+    return /(^|\.)asura(scans|comic)\.(com|net)$/.test(new URL(ch.url).hostname);
+  } catch {
+    return false;
+  }
 }
 
 export async function getStorageByTitle() {

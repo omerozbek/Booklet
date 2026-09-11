@@ -1,5 +1,12 @@
 import { createContext, useContext, useRef, useState, useCallback } from 'react';
-import { saveImage, saveChapterMeta, updateChapterMeta, clearChapterImages } from '../db';
+import {
+  saveImage,
+  saveChapterMeta,
+  updateChapterMeta,
+  clearChapterImages,
+  needsRedownload,
+  DOWNLOAD_FORMAT,
+} from '../db';
 
 const DownloadContext = createContext(null);
 
@@ -37,7 +44,7 @@ export function DownloadProvider({ children }) {
       // behind, and if it had more pages than this one those extras would
       // survive at the end of the chapter.
       await clearChapterImages(chapter.url);
-      await updateChapterMeta(chapter.url, { downloaded: false, imageCount: 0 });
+      await updateChapterMeta(chapter.url, { downloaded: false, imageCount: 0, savedWith: undefined });
 
       setDownloads((prev) => ({ ...prev, [chapter.url]: { current: 0, total: images.length } }));
 
@@ -55,11 +62,9 @@ export function DownloadProvider({ children }) {
         // A half-saved chapter reads as a corrupt one, so leave nothing behind.
         await clearChapterImages(chapter.url);
       } else {
-        const stored = await updateChapterMeta(chapter.url, {
-          downloaded: true,
-          imageCount: images.length,
-        });
-        const updated = stored || { ...chapter, downloaded: true, imageCount: images.length };
+        const done = { downloaded: true, imageCount: images.length, savedWith: DOWNLOAD_FORMAT };
+        const stored = await updateChapterMeta(chapter.url, done);
+        const updated = stored || { ...chapter, ...done };
         if (!stored) await saveChapterMeta(updated);
         onComplete?.(updated);
       }
@@ -90,7 +95,9 @@ export function DownloadProvider({ children }) {
     async (chapters, titleUrl, onChapterComplete) => {
       cancelAllRef.current = false;
       setDownloadingAll((prev) => ({ ...prev, [titleUrl]: true }));
-      const toDownload = chapters.filter((c) => !c.downloaded && !inFlightRef.current.has(c.url));
+      const toDownload = chapters.filter(
+        (c) => (!c.downloaded || needsRedownload(c)) && !inFlightRef.current.has(c.url)
+      );
       // One failing chapter used to pop a modal that blocked the whole run.
       // Collect them instead and report once at the end.
       const failed = [];

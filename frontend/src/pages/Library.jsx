@@ -8,6 +8,8 @@ export default function Library() {
   const [titles, setTitles] = useState([]);
   const [showAdd, setShowAdd] = useState(false);
   const [lastRead, setLastRead] = useState(null);
+  const [pendingDelete, setPendingDelete] = useState(null); // title awaiting confirmation
+  const [deleting, setDeleting] = useState(false);
   const navigate = useNavigate();
 
   const loadTitles = useCallback(async () => {
@@ -22,11 +24,29 @@ export default function Library() {
     } catch {}
   }, [loadTitles]);
 
-  async function handleDelete(e, url) {
+  // Confirmation is an in-app sheet rather than window.confirm(): native
+  // dialogs aren't dependable in a Home Screen web app on iOS, and a dialog
+  // that never appears reads as a delete button that does nothing.
+  function askDelete(e, title) {
+    e.preventDefault();
     e.stopPropagation();
-    if (!confirm('Remove this title and all downloaded chapters?')) return;
-    await deleteTitle(url);
-    setTitles((prev) => prev.filter((t) => t.url !== url));
+    setPendingDelete(title);
+  }
+
+  async function confirmDelete() {
+    if (!pendingDelete) return;
+    const { url } = pendingDelete;
+    setDeleting(true);
+    try {
+      await deleteTitle(url);
+      setTitles((prev) => prev.filter((t) => t.url !== url));
+      if (lastRead?.titleUrl === url) setLastRead(null);
+      setPendingDelete(null);
+    } catch (err) {
+      alert(`Could not delete: ${err.message}`);
+    } finally {
+      setDeleting(false);
+    }
   }
 
   const lastReadTitle = lastRead ? titles.find((t) => t.url === lastRead.titleUrl) : null;
@@ -92,8 +112,9 @@ export default function Library() {
                   )}
                   <button
                     className="title-card-delete"
-                    onClick={(e) => handleDelete(e, t.url)}
+                    onClick={(e) => askDelete(e, t)}
                     title="Delete title"
+                    aria-label={`Delete ${t.title || 'title'}`}
                   >
                     ✕
                   </button>
@@ -104,6 +125,31 @@ export default function Library() {
           </div>
         )}
       </div>
+
+      {pendingDelete && (
+        <div className="sheet-backdrop" onClick={() => !deleting && setPendingDelete(null)}>
+          <div className="sheet" onClick={(e) => e.stopPropagation()}>
+            <h2>Remove title?</h2>
+            <p style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 20, lineHeight: 1.5 }}>
+              <strong style={{ color: 'var(--text)' }}>{pendingDelete.title || 'This title'}</strong> and
+              all of its downloaded chapters will be deleted from this device.
+            </p>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button
+                className="btn btn-secondary"
+                style={{ flex: 1 }}
+                onClick={() => setPendingDelete(null)}
+                disabled={deleting}
+              >
+                Cancel
+              </button>
+              <button className="btn btn-primary" style={{ flex: 1 }} onClick={confirmDelete} disabled={deleting}>
+                {deleting ? 'Deleting…' : 'Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showAdd && (
         <AddTitle
